@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { listProjects } from "@/lib/neon-api";
+import { listProjectsAcrossOrgs } from "@/lib/neon-api";
 import { MISSING_API_KEY_ERROR, resolveApiKey } from "@/lib/neon-credentials";
 
 /* POST /api/neon/projects/list
@@ -20,7 +20,7 @@ export async function POST(request: NextRequest) {
   }
   const orgId = body.orgId || process.env.NEON_ORG_ID || undefined;
   try {
-    const result = await listProjects(apiKey, { orgId, limit: 100 });
+    const result = await listProjectsAcrossOrgs(apiKey, { orgId, limit: 100 });
     const projects = result.projects
       .filter((p) => p.id !== body.excludeProjectId)
       .map((p) => ({

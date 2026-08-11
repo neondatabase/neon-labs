@@ -195,6 +195,20 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* Entrance for the launcher cards. Transform + opacity only so the
+   animation stays off the main thread. --enter-delay staggers siblings. */
+.enter-rise {
+  animation: enter-rise 260ms var(--ease-out-soft) both;
+  animation-delay: var(--enter-delay, 0ms);
+}
+
+@keyframes enter-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

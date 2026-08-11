@@ -3,7 +3,9 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  PlusCircle,
+  ArrowLeftRight,
+  CircleArrowUp,
+  Home,
   ListChecks,
   Puzzle,
   FileText,
@@ -30,7 +32,9 @@ import {
 } from "./ui/sidebar";
 
 const PRIMARY = [
-  { href: "/", label: "New assessment", icon: PlusCircle },
+  { href: "/", label: "Home", icon: Home },
+  { href: "/assess", label: "PG Upgrade Assistant", icon: CircleArrowUp },
+  { href: "/migrate", label: "Migration Assistant", icon: ArrowLeftRight },
 ];
 
 const ASSESSMENT = [
@@ -60,7 +64,7 @@ export function Sidebar() {
         <div className="flex h-[52px] items-center gap-[10px] border-b border-sidebar-border px-4 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0">
           <NeonMark className="h-[18px] w-[18px] shrink-0 text-primary" />
           <span className="truncate text-[13.5px] font-medium tracking-[-0.2px] text-foreground group-data-[collapsible=icon]:hidden">
-            Neon Upgrade Advisor
+            Neon Labs
           </span>
         </div>
       </SidebarHeader>

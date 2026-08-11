@@ -62,6 +62,18 @@ export async function getOrganization(apiKey: string, orgId: string) {
   );
 }
 
+export interface NeonOrganization {
+  id: string;
+  name: string;
+}
+
+export async function listOrganizations(apiKey: string) {
+  return neonFetch<{ organizations: NeonOrganization[] }>(
+    "/users/me/organizations",
+    apiKey,
+  );
+}
+
 export interface ListProjectsResponse {
   projects: NeonProject[];
   pagination?: { cursor?: string };
@@ -79,6 +91,28 @@ export async function listProjects(
     `/projects${qs ? `?${qs}` : ""}`,
     apiKey,
   );
+}
+
+/* Neon rejects an org-less GET /projects with "org_id is required", so when
+   the caller has no org configured, fan out over the orgs the key can see.
+   One unreachable org shouldn't blank the whole picker, so failures are
+   dropped rather than propagated. */
+export async function listProjectsAcrossOrgs(
+  apiKey: string,
+  opts: { orgId?: string; limit?: number } = {},
+): Promise<ListProjectsResponse> {
+  if (opts.orgId) return listProjects(apiKey, opts);
+
+  const { organizations } = await listOrganizations(apiKey);
+  const results = await Promise.allSettled(
+    organizations.map((org) =>
+      listProjects(apiKey, { orgId: org.id, limit: opts.limit }),
+    ),
+  );
+  const projects = results.flatMap((r) =>
+    r.status === "fulfilled" ? r.value.projects : [],
+  );
+  return { projects };
 }
 
 export async function getConnectionUri(

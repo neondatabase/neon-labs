@@ -75,7 +75,7 @@ export default function ChangesPage() {
             title="No version analysis"
             description="Run an upgrade assessment to see which Postgres breaking changes will affect your schema."
             action={
-              <Button size="lg" variant="white" nativeButton={false} render={<Link href="/" />}>
+              <Button size="lg" variant="white" nativeButton={false} render={<Link href="/assess" />}>
                 New Assessment
                 <ArrowRight className="h-3.5 w-3.5" />
               </Button>
