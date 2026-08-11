@@ -6,7 +6,11 @@ export type PgMajorVersion = 14 | 15 | 16 | 17 | 18;
 
 export const NEON_SUPPORTED_VERSIONS: PgMajorVersion[] = [14, 15, 16, 17, 18];
 
-export type AssessmentMethod = "script" | "direct";
+/** Assessments are always produced by connecting to the source database and
+    running read-only catalog queries. The offline collector/ZIP-upload path
+    was removed: accepting customer archives is an unnecessary attack surface
+    for a hosted deployment. */
+export type AssessmentMethod = "direct";
 
 export type CheckSeverity = "info" | "warning" | "blocker";
 export type CheckStatus = "pass" | "warning" | "blocker";

@@ -63,8 +63,7 @@ export function SetupLanding({ status }: { status: SetupStatus }) {
       toast({
         tone: "error",
         title: "Couldn't read configuration",
-        description:
-          "The /api/neon/config route didn't respond. Is the dev server running?",
+        description: "The connection check failed. Try again in a moment.",
       });
     } finally {
       setChecking(false);
@@ -147,7 +146,7 @@ export function SetupLanding({ status }: { status: SetupStatus }) {
             <p className={`text-caption tabular-nums ${neon.muted}`}>
               {busy
                 ? "Checking .env.local"
-                : `${satisfiedCount} of ${required.length} found. Restart the dev server if it stays missing.`}
+                : `${satisfiedCount} of ${required.length} found.`}
             </p>
             <button
               type="button"
@@ -204,7 +203,9 @@ export function SetupLanding({ status }: { status: SetupStatus }) {
           <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#00e599]" />
           <span className="text-pretty">
             <code className="font-mono">.env.local</code> is gitignored and
-            never reaches the browser. Use an org-scoped key on shared projects.
+            never reaches the browser. Hosted, this setup screen will be
+            replaced by OAuth; customer credentials and assessment results are
+            not persisted by the app.
           </span>
         </p>
       </div>

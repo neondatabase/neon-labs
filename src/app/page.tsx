@@ -7,7 +7,7 @@ const TOOLS = [
   {
     href: "/assess",
     icon: CircleArrowUp,
-    title: "PG Upgrade Assistant",
+    title: "PG Upgrade Assessment",
     description:
       "Upgrade your Postgres major version on Neon. Assess breaking changes, plan your migration path, and execute the upgrade with guided tooling.",
   },

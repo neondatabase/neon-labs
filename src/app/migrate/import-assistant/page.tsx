@@ -21,6 +21,7 @@ import {
   NoticeTitle,
 } from "@/components/ui/notice";
 import {
+  getNeonSettings,
   getTargetOverride,
   type TargetOverride,
 } from "@/lib/neon-settings";
@@ -56,11 +57,13 @@ export default function ImportAssistantPage() {
     setPolling(true);
     setError(null);
     try {
+      const { apiKey } = getNeonSettings();
       const res = await fetch("/api/neon/import-assistant/status", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          targetConnectionString: override?.connectionUri,
+          apiKey,
+          targetProjectId: override?.projectId,
           projectId: override?.projectId,
         }),
       });
@@ -91,7 +94,7 @@ export default function ImportAssistantPage() {
      unreachable, since it only renders past this point. This flow needs no
      source: you enter those credentials in the Neon Console. */
   const targetReady = Boolean(
-    override?.connectionUri || cfg?.hasTargetConnection,
+    override?.projectId || cfg?.hasTargetConnection,
   );
 
   const pickerRow = (

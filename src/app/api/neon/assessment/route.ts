@@ -3,12 +3,20 @@ import {
   introspectAssessment,
   NotAnUpgradeError,
 } from "@/lib/neon-introspect";
+import {
+  MISSING_CONNECTIONS_ERROR,
+  resolveConnections,
+} from "@/lib/neon-credentials";
 import type { PgMajorVersion } from "@/lib/types";
+
+const NO_STORE = { "Cache-Control": "private, no-store, max-age=0" };
 
 /* POST /api/neon/assessment
    body: {
      source?: "env" | <connection-string>,
+     apiKey?: string,
      sourceConnectionString?: string,
+     sourceProjectId?: string,
      targetVersion?: number,
      projectName?: string,
      projectId?: string,
@@ -17,14 +25,16 @@ import type { PgMajorVersion } from "@/lib/types";
    }
    Returns a fully populated AssessmentResult by introspecting the live source
    Neon project. Resolution order for the source connection:
-     1. body.sourceConnectionString (picker override)
-     2. body.source (legacy "env" or literal string)
-     3. NEON_SOURCE_CONNECTION_STRING from .env.local
+     1. body.sourceConnectionString (local-development override)
+     2. NEON_SOURCE_CONNECTION_STRING from .env.local
+     3. Neon API lookup by body.sourceProjectId using the current user's key
 */
 export async function POST(request: NextRequest) {
   let body: {
     source?: string;
+    apiKey?: string;
     sourceConnectionString?: string;
+    sourceProjectId?: string;
     targetVersion?: number;
     projectName?: string;
     projectId?: string;
@@ -34,22 +44,24 @@ export async function POST(request: NextRequest) {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+    return NextResponse.json(
+      { error: "Invalid JSON" },
+      { status: 400, headers: NO_STORE },
+    );
   }
 
-  const conn =
-    body.sourceConnectionString ||
-    (body.source && body.source !== "env"
-      ? body.source
-      : process.env.NEON_SOURCE_CONNECTION_STRING);
+  const { source: conn } = await resolveConnections({
+    apiKey: body.apiKey,
+    sourceConnectionString:
+      body.sourceConnectionString ||
+      (body.source && body.source !== "env" ? body.source : undefined),
+    sourceProjectId: body.sourceProjectId,
+  });
 
   if (!conn) {
     return NextResponse.json(
-      {
-        error:
-          "No source connection string available. Pick a source project above or set NEON_SOURCE_CONNECTION_STRING in .env.local.",
-      },
-      { status: 400 },
+      { error: MISSING_CONNECTIONS_ERROR },
+      { status: 400, headers: NO_STORE },
     );
   }
 
@@ -60,14 +72,17 @@ export async function POST(request: NextRequest) {
       projectId: body.projectId,
       projectName: body.projectName,
     });
-    return NextResponse.json(result);
+    return NextResponse.json(result, { headers: NO_STORE });
   } catch (e) {
     if (e instanceof NotAnUpgradeError) {
-      return NextResponse.json({ error: e.message }, { status: 400 });
+      return NextResponse.json(
+        { error: e.message },
+        { status: 400, headers: NO_STORE },
+      );
     }
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "Introspection failed" },
-      { status: 502 },
+      { status: 502, headers: NO_STORE },
     );
   }
 }

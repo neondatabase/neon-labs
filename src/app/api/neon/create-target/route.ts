@@ -5,7 +5,8 @@ import { MISSING_API_KEY_ERROR, resolveApiKey } from "@/lib/neon-credentials";
 /* POST /api/neon/create-target
    body: { apiKey, name, pgVersion, regionId?, orgId? }
    Creates a new Neon project in the user's org at the target PG version.
-   Returns project metadata + the read-write connection string.
+   Returns project metadata only. Routes resolve connection URIs server-side
+   from the project id when they need one.
 */
 export async function POST(request: NextRequest) {
   let body: {
@@ -49,7 +50,6 @@ export async function POST(request: NextRequest) {
       },
       branch: result.branch,
       endpointHost: result.endpoints?.[0]?.host ?? null,
-      connectionUri: result.connection_uris?.[0]?.connection_uri ?? null,
       consoleUrl: `https://console.neon.tech/app/projects/${result.project.id}`,
     });
   } catch (e) {

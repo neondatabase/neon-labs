@@ -5,12 +5,14 @@ import {
 } from "@/lib/neon-credentials";
 import { status } from "@/lib/neon-replication";
 
-export async function GET(request: NextRequest) {
-  const url = new URL(request.url);
-  const { source, target } = await resolveConnections({
-    sourceConnectionString: url.searchParams.get("source"),
-    targetConnectionString: url.searchParams.get("target"),
-  });
+export async function POST(request: NextRequest) {
+  let body: Parameters<typeof resolveConnections>[0] = {};
+  try {
+    body = await request.json();
+  } catch {
+    /* allow env-backed local development */
+  }
+  const { source, target } = await resolveConnections(body);
   if (!target) {
     return NextResponse.json(
       { error: MISSING_CONNECTIONS_ERROR },

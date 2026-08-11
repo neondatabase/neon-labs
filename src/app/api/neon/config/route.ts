@@ -11,19 +11,15 @@ import { resolveApiKey, resolveConnections } from "@/lib/neon-credentials";
    serialised into this response.
 */
 
-let cachedOrg: { id: string; name: string } | null = null;
-
 async function resolveOrgName(orgId: string | null) {
   if (process.env.NEON_ORG_NAME) return process.env.NEON_ORG_NAME;
   if (!orgId) return null;
-  if (cachedOrg?.id === orgId) return cachedOrg.name;
 
   const apiKey = resolveApiKey();
   if (!apiKey) return null;
 
   try {
     const org = await getOrganization(apiKey, orgId);
-    cachedOrg = { id: orgId, name: org.name };
     return org.name;
   } catch {
     return null;

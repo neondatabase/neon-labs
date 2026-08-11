@@ -7,10 +7,7 @@ import {
   AlertTriangle,
   ArrowRight,
   CheckCircle2,
-  Database,
-  ExternalLink,
   Loader2,
-  PlayCircle,
   RefreshCw,
   Terminal,
   Zap,
@@ -27,6 +24,7 @@ import {
   NoticeTitle,
 } from "@/components/ui/notice";
 import {
+  getNeonSettings,
   getSourceOverride,
   getTargetOverride,
   type TargetOverride,
@@ -71,14 +69,14 @@ export default function DumpRestorePage() {
       .catch(() => setCfg(null));
   }, []);
 
-  // Send whichever sides the user picked in-app; the server falls back to env
-  // for anything omitted.
+  // Send project ids only. The server resolves short-lived connection URIs.
   const targetBody = () => {
     const body: Record<string, string> = {};
-    if (sourceOverride?.connectionUri)
-      body.sourceConnectionString = sourceOverride.connectionUri;
-    if (override?.connectionUri)
-      body.targetConnectionString = override.connectionUri;
+    const { apiKey } = getNeonSettings();
+    if (apiKey) body.apiKey = apiKey;
+    if (sourceOverride?.projectId)
+      body.sourceProjectId = sourceOverride.projectId;
+    if (override?.projectId) body.targetProjectId = override.projectId;
     return body;
   };
 
@@ -139,10 +137,10 @@ export default function DumpRestorePage() {
      just the env vars cfg reports. Gating on cfg alone made the pickers
      below unreachable, since they only render past this point. */
   const sourceReady = Boolean(
-    sourceOverride?.connectionUri || cfg?.hasSourceConnection,
+    sourceOverride?.projectId || cfg?.hasSourceConnection,
   );
   const targetReady = Boolean(
-    override?.connectionUri || cfg?.hasTargetConnection,
+    override?.projectId || cfg?.hasTargetConnection,
   );
 
   const pickerRow = (

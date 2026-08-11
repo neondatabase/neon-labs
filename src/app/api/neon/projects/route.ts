@@ -9,21 +9,12 @@ import { resolveApiKey } from "@/lib/neon-credentials";
    wrong guess lets a no-op upgrade through validation.
 */
 
-const versionCache = new Map<string, { pgVersion: number; expiresAt: number }>();
-const CACHE_TTL_MS = 5 * 60 * 1000;
-
 async function pgVersionFor(projectId: string | undefined) {
   if (!projectId) return null;
-  const cached = versionCache.get(projectId);
-  if (cached && cached.expiresAt > Date.now()) return cached.pgVersion;
   const apiKey = resolveApiKey();
   if (!apiKey) return null;
   try {
     const { project } = await getProject(apiKey, projectId);
-    versionCache.set(projectId, {
-      pgVersion: project.pg_version,
-      expiresAt: Date.now() + CACHE_TTL_MS,
-    });
     return project.pg_version;
   } catch {
     return null;

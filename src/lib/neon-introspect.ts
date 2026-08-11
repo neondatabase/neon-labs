@@ -34,6 +34,7 @@ interface RawSnapshot {
   pgVersionFull: string;
   pgVersionMajor: number;
   database: string;
+  databaseCount: number;
   totalSizeBytes: number;
   tableCount: number;
   indexCount: number;
@@ -68,9 +69,20 @@ async function snapshot(connectionString: string): Promise<RawSnapshot> {
     const num = parseInt(v.rows[0].num, 10);
     const major = Math.floor(num / 10000);
 
-    const sizeRes = await client.query<{ bytes: string }>(
-      "SELECT pg_database_size(current_database())::text AS bytes",
-    );
+    /* Size every database on the project, not just the one we connected to.
+       The total picks the recommended migration path, and the Import Data
+       Assistant caps out around 10 GB — sizing a single database would
+       recommend it for projects well past that limit. Databases we can't
+       connect to would make pg_database_size() throw, so they're excluded. */
+    const sizeRes = await client.query<{ bytes: string; databases: string }>(`
+      SELECT
+        coalesce(sum(pg_database_size(datname)), 0)::text AS bytes,
+        count(*)::text AS databases
+      FROM pg_database
+      WHERE NOT datistemplate
+        AND datallowconn
+        AND has_database_privilege(datname, 'CONNECT')
+    `);
 
     const counts = await client.query<{ tables: string; indexes: string }>(`
       SELECT
@@ -209,6 +221,7 @@ async function snapshot(connectionString: string): Promise<RawSnapshot> {
       pgVersionFull: v.rows[0].version,
       pgVersionMajor: major,
       database: v.rows[0].db,
+      databaseCount: parseInt(sizeRes.rows[0].databases, 10),
       totalSizeBytes: parseInt(sizeRes.rows[0].bytes, 10),
       tableCount: parseInt(counts.rows[0].tables, 10),
       indexCount: parseInt(counts.rows[0].indexes, 10),
@@ -535,7 +548,7 @@ export async function introspectAssessment(
   );
 
   const stats: AssessmentStats = {
-    databases: 1,
+    databases: snap.databaseCount,
     tables: snap.tableCount,
     indexes: snap.indexCount,
     totalSizeGb,

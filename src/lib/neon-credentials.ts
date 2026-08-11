@@ -13,18 +13,11 @@ export const MISSING_API_KEY_ERROR =
 export const MISSING_CONNECTIONS_ERROR =
   "Could not resolve connection strings. Set NEON_API_KEY in .env.local so the app can fetch them, pick source and target projects in the app, or set NEON_SOURCE_CONNECTION_STRING and NEON_TARGET_CONNECTION_STRING directly.";
 
-/* A connection URI carries the role password, so it never leaves the server.
-   Entries expire because Neon rotates credentials on role password reset. */
-const CACHE_TTL_MS = 5 * 60 * 1000;
-const uriCache = new Map<string, { uri: string; expiresAt: number }>();
-
 async function connectionUriForProject(apiKey: string, projectId: string) {
-  const cached = uriCache.get(projectId);
-  if (cached && cached.expiresAt > Date.now()) return cached.uri;
   try {
-    const uri = await resolveConnectionUri(apiKey, projectId);
-    uriCache.set(projectId, { uri, expiresAt: Date.now() + CACHE_TTL_MS });
-    return uri;
+    /* Do not cache database credentials in application memory. Resolve them
+       only for the request that needs them. */
+    return await resolveConnectionUri(apiKey, projectId);
   } catch {
     return null;
   }

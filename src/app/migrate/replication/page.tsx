@@ -116,14 +116,12 @@ export default function ReplicationPage() {
      Neon API calls below need its project id either way. */
   const sourceProjectId = sourceOverride?.projectId ?? cfg?.sourceProjectId ?? null;
 
-  // Body shape every replication route accepts: pass both connection strings
-  // when the user has picked overrides, otherwise the server falls back to env.
+  // Routes resolve connection URIs server-side from these project ids. The
+  // browser never receives or stores database passwords.
   const targetBody = () => {
     const body: Record<string, string> = {};
-    if (sourceOverride?.connectionUri)
-      body.sourceConnectionString = sourceOverride.connectionUri;
-    if (targetOverride?.connectionUri)
-      body.targetConnectionString = targetOverride.connectionUri;
+    const { apiKey } = getNeonSettings();
+    if (apiKey) body.apiKey = apiKey;
     if (sourceOverride?.projectId) body.sourceProjectId = sourceOverride.projectId;
     if (targetOverride?.projectId) body.targetProjectId = targetOverride.projectId;
     return body;
@@ -153,13 +151,11 @@ export default function ReplicationPage() {
   // Auto-poll status during monitoring phase
   const pollStatus = useCallback(async () => {
     try {
-      const qs = new URLSearchParams();
-      if (targetOverride?.connectionUri)
-        qs.set("target", targetOverride.connectionUri);
-      if (sourceOverride?.connectionUri)
-        qs.set("source", sourceOverride.connectionUri);
-      const q = qs.toString() ? `?${qs.toString()}` : "";
-      const res = await fetch(`/api/neon/replication/status${q}`);
+      const res = await fetch("/api/neon/replication/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(targetBody()),
+      });
       const body = await res.json();
       if (res.ok) setStatus(body);
     } catch {
@@ -370,13 +366,11 @@ export default function ReplicationPage() {
   const fetchMonitor = useCallback(async () => {
     setMonitorLoading(true);
     try {
-      const qs = new URLSearchParams();
-      if (targetOverride?.connectionUri)
-        qs.set("target", targetOverride.connectionUri);
-      if (sourceOverride?.connectionUri)
-        qs.set("source", sourceOverride.connectionUri);
-      const q = qs.toString() ? `?${qs.toString()}` : "";
-      const res = await fetch(`/api/neon/replication/monitor${q}`);
+      const res = await fetch("/api/neon/replication/monitor", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(targetBody()),
+      });
       const body = await res.json();
       if (res.ok) setMonitor(body);
     } catch {
@@ -458,10 +452,10 @@ export default function ReplicationPage() {
      just the env vars cfg reports. Gating on cfg alone made the pickers
      below unreachable, since they only render past this point. */
   const sourceReady = Boolean(
-    sourceOverride?.connectionUri || cfg?.hasSourceConnection,
+    sourceOverride?.projectId || cfg?.hasSourceConnection,
   );
   const targetReady = Boolean(
-    targetOverride?.connectionUri || cfg?.hasTargetConnection,
+    targetOverride?.projectId || cfg?.hasTargetConnection,
   );
 
   const apiKeyAction = (

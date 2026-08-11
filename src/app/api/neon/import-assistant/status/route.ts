@@ -1,8 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  MISSING_CONNECTIONS_ERROR,
-  resolveConnections,
-} from "@/lib/neon-credentials";
+import { resolveConnections } from "@/lib/neon-credentials";
 import { Client } from "pg";
 import type { ImportAssistantStatus } from "@/lib/types";
 
@@ -12,11 +9,16 @@ import type { ImportAssistantStatus } from "@/lib/types";
    has finished populating tables/rows. Returns per-table row counts and a
    deep-link back to the Neon Console import page.
 
-   POST rather than GET because the target connection string carries a
-   password, and query strings get written to access logs and browser history.
+   POST keeps project selection out of browser history. Connection credentials
+   are resolved server-side and never returned to the browser.
 */
 export async function POST(request: NextRequest) {
-  let body: { targetConnectionString?: string; projectId?: string } = {};
+  let body: {
+    apiKey?: string;
+    targetConnectionString?: string;
+    targetProjectId?: string;
+    projectId?: string;
+  } = {};
   try {
     body = await request.json();
   } catch {

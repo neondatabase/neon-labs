@@ -33,7 +33,7 @@ import {
 
 const PRIMARY = [
   { href: "/", label: "Home", icon: Home },
-  { href: "/assess", label: "PG Upgrade Assistant", icon: CircleArrowUp },
+  { href: "/assess", label: "PG Upgrade Assessment", icon: CircleArrowUp },
   { href: "/migrate", label: "Migration Assistant", icon: ArrowLeftRight },
 ];
 

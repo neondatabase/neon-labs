@@ -25,7 +25,7 @@ const SECTIONS: { match: (p: string) => boolean; label: string; href: string }[]
     },
     {
       match: (p) => p.startsWith("/assess") || p.startsWith("/changes"),
-      label: "PG Upgrade Assistant",
+      label: "PG Upgrade Assessment",
       href: "/assess",
     },
   ];

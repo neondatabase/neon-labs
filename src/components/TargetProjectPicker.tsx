@@ -48,8 +48,8 @@ interface ServerConfig {
 }
 
 /** Compact dropdown that lets the user pick which project in their org should
-    act as the upgrade source or target. Stores selection in localStorage so
-    it persists across page navigations. Env defaults are honored when the
+    act as the upgrade source or target. Stores non-secret project metadata in
+    sessionStorage for this tab. Env defaults are honored when the
     user hasn't picked an override.
 
     `targetPgVersion` controls (a) the PG version used when creating a new
@@ -135,34 +135,18 @@ export function TargetProjectPicker({
     }
   }
 
-  async function selectProject(p: ProjectRow) {
+  function selectProject(p: ProjectRow) {
     setError(null);
-    setLoading(true);
-    try {
-      const { apiKey } = getNeonSettings();
-      const res = await fetch("/api/neon/projects/connection-uri", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiKey, projectId: p.id, pooled: false }),
-      });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body?.error ?? `Failed (${res.status})`);
-      const next: TargetOverride = {
-        projectId: p.id,
-        projectName: p.name,
-        pgVersion: p.pg_version,
-        regionId: p.region_id,
-        connectionUri: body.uri,
-      };
-      writeOverride(next);
-      setOverrideState(next);
-      onChange?.(next);
-      setOpen(false);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch connection");
-    } finally {
-      setLoading(false);
-    }
+    const next: TargetOverride = {
+      projectId: p.id,
+      projectName: p.name,
+      pgVersion: p.pg_version,
+      regionId: p.region_id,
+    };
+    writeOverride(next);
+    setOverrideState(next);
+    onChange?.(next);
+    setOpen(false);
   }
 
   function clearOverride() {
@@ -204,7 +188,6 @@ export function TargetProjectPicker({
         projectName: body.project.name,
         pgVersion: body.project.pg_version,
         regionId: body.project.region_id,
-        connectionUri: body.connectionUri ?? "",
       };
       writeOverride(next);
       setOverrideState(next);

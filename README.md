@@ -81,10 +81,12 @@ NEON_ORG_NAME=My Org
   detects breaking changes between source and target PG version,
   installed extensions, custom collations, public-schema writers,
   pl/pgsql functions used in expression indexes, etc.
-- **Upload offline bundle** — for users who can't share a connection
-  string (network restrictions, compliance). Download the included
-  `customer_pg_assessment.sh` from the New Assessment page, run it on
-  your DB host, upload the resulting ZIP.
+Assessment is connection-only. An earlier "upload an offline bundle"
+path let users run a collector script and upload the resulting ZIP;
+it was removed because accepting archives from customers is an
+unnecessary attack surface for a hosted deployment. Everything the
+analyzer read from those archives came from catalog queries the live
+path already runs.
 
 ### Reference
 - **Extensions** — searchable reference of Neon's PG extension support,
@@ -99,18 +101,40 @@ The cleanest path right now is **everyone clones their own copy** and
 points it at their own Neon org via their own `.env.local`. Their
 credentials never touch your machine and vice versa.
 
-A hosted multi-tenant version would need a Neon partner OAuth client.
+A hosted multi-tenant version (labs.neon.com) needs a Neon partner
+OAuth client. A shared server-side API key won't do: every visitor
+would be acting as whoever owns that key, with read access to that
+org's projects and connection URIs.
+
+Two things in this repo assume single-tenant local use and need to
+move to per-user OAuth tokens before hosting:
+
+- `resolveApiKey()` falls back to the `NEON_API_KEY` environment
+  variable, which under OAuth should come from the session instead.
+- `NEON_SOURCE_CONNECTION_STRING` / `NEON_TARGET_CONNECTION_STRING`
+  let the server skip the Neon API entirely. Hosted, every connection
+  URI should be fetched per-request for the authorizing user.
+
+The read-only scopes are enough: projects read plus connection URI
+read. Nothing in the assessment flow writes.
 
 ## Security notes
 
 - `.env.local` is gitignored. Don't commit it.
-- The Neon API key lives in your browser's `localStorage` once you
-  paste it in. It's only ever sent to this app's own `/api/*` routes,
-  never to a third party.
+- Until OAuth is wired, an API key pasted into the local-development
+  settings lives in `sessionStorage` and is cleared when the tab closes.
+  Legacy `localStorage` credentials are removed automatically. Hosted,
+  replace this fallback with an HttpOnly OAuth session.
 - Connection strings in `.env.local` are read by the Next.js server
-  process only. They aren't exposed to the browser.
-- The app only reads. It runs catalog introspection against your source
-  and never writes to your database.
+  process only. Project selection sends project ids; connection URIs are
+  resolved per request, never returned to the browser, and never cached
+  in application memory.
+- Assessment results live only in React memory and disappear on refresh.
+  Neon API responses are marked `Cache-Control: no-store`; this app has no
+  database, analytics sink, or server-side persistence for customer data.
+- Assessments run read-only catalog queries. Migration actions are
+  explicitly separate and can create publications/subscriptions or copy
+  data after user confirmation.
 
 ## Development
 
@@ -121,10 +145,8 @@ npm run lint
 ```
 
 Stack: Next.js 16 (App Router) + TypeScript + Tailwind CSS + `pg` for
-direct Postgres connections + JSZip for offline bundle parsing.
+direct Postgres connections.
 
 ## License
 
-MIT. The collector script (`public/customer_pg_assessment.sh`) is
-adapted from [neondatabase/pg-prechecks](https://github.com/neondatabase/pg-prechecks)
-(also MIT).
+MIT.

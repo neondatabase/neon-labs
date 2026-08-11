@@ -34,7 +34,6 @@ interface ProvisionResult {
   };
   branch: { id: string; name: string };
   endpointHost: string | null;
-  connectionUri: string | null;
   consoleUrl: string;
 }
 
@@ -281,22 +280,11 @@ export function ProvisionTargetCard({
                 onCopy={() => copy("host", result.endpointHost!)}
               />
             )}
-            {result.connectionUri && (
-              <Row
-                label="Connection string"
-                value="postgresql://…"
-                copyValue={result.connectionUri}
-                copied={copied === "uri"}
-                onCopy={() => copy("uri", result.connectionUri!)}
-              />
-            )}
           </dl>
 
           <p className="mt-3 text-label text-[#9ca3af]">
-            Next: add this connection string to{" "}
-            <span className="font-mono">NEON_TARGET_CONNECTION_STRING</span> in{" "}
-            <span className="font-mono">.env.local</span> to enable the live
-            schema diff against this new project.
+            The app keeps only the project id. Connection credentials are
+            resolved server-side when a migration step needs them.
           </p>
         </div>
       )}

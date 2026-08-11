@@ -35,6 +35,7 @@ export interface Requirement {
 export interface SetupStatus {
   loading: boolean;
   initializing: boolean;
+  error: string | null;
   env: EnvConfig | null;
   requirements: Requirement[];
   ready: boolean;
@@ -98,32 +99,46 @@ export function useSetupStatus(): SetupStatus {
   const [env, setEnv] = useState<EnvConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [initializing, setInitializing] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [skipped, setSkippedState] = useState(isSetupSkipped);
 
-  const load = useCallback(async (): Promise<EnvConfig | null> => {
+  const load = useCallback(async (): Promise<EnvConfig> => {
     const started = Date.now();
-    let data: EnvConfig | null = null;
     try {
       const res = await fetch("/api/neon/config", { cache: "no-store" });
-      data = res.ok ? ((await res.json()) as EnvConfig) : null;
-    } catch {
-      data = null;
+      if (!res.ok) {
+        throw new Error(`Configuration check failed (${res.status})`);
+      }
+      return (await res.json()) as EnvConfig;
+    } finally {
+      const elapsed = Date.now() - started;
+      if (elapsed < MIN_CHECK_MS) {
+        await new Promise((r) => setTimeout(r, MIN_CHECK_MS - elapsed));
+      }
     }
-    const elapsed = Date.now() - started;
-    if (elapsed < MIN_CHECK_MS) {
-      await new Promise((r) => setTimeout(r, MIN_CHECK_MS - elapsed));
-    }
-    return data;
   }, []);
 
   useEffect(() => {
     let cancelled = false;
-    load().then((data) => {
-      if (cancelled) return;
-      setEnv(data);
-      setLoading(false);
-      setInitializing(false);
-    });
+    load()
+      .then((data) => {
+        if (cancelled) return;
+        setEnv(data);
+        setError(null);
+      })
+      .catch((cause: unknown) => {
+        if (cancelled) return;
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "Could not check Neon configuration",
+        );
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setLoading(false);
+        setInitializing(false);
+      });
     return () => {
       cancelled = true;
     };
@@ -132,11 +147,33 @@ export function useSetupStatus(): SetupStatus {
   const refresh = useCallback(async () => {
     setLoading(true);
     setSkippedState(isSetupSkipped());
-    const data = await load();
-    setEnv(data);
-    setLoading(false);
-    return buildRequirements(data);
+    try {
+      const data = await load();
+      setEnv(data);
+      setError(null);
+      return buildRequirements(data);
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not check Neon configuration",
+      );
+      throw cause;
+    } finally {
+      setLoading(false);
+    }
   }, [load]);
+
+  /* A brief dev-server restart or network blip should not strand the user on
+     the setup page. Retry when they return to the tab after a failed check. */
+  useEffect(() => {
+    if (!error) return;
+    const retryOnFocus = () => {
+      void refresh().catch(() => undefined);
+    };
+    window.addEventListener("focus", retryOnFocus);
+    return () => window.removeEventListener("focus", retryOnFocus);
+  }, [error, refresh]);
 
   const skip = useCallback(() => {
     setSetupSkipped(true);
@@ -153,9 +190,10 @@ export function useSetupStatus(): SetupStatus {
   return {
     loading,
     initializing,
+    error,
     env,
     requirements,
-    ready: requirements.every((r) => r.optional || r.satisfied),
+    ready: !error && requirements.every((r) => r.optional || r.satisfied),
     skipped,
     skip,
     unskip,
