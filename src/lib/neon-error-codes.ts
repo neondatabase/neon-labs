@@ -226,15 +226,14 @@ export function classifyError(e: unknown): ClassifiedError {
       title: "Neon API authentication failed",
       raw: msg,
       explanation:
-        "The stored Neon API key was rejected. It may be expired, revoked, or scoped to a different org.",
+        "Your Neon OAuth session was rejected. It may have expired, been revoked, or lack access to the organization that owns this project.",
       nextSteps: [
-        "Generate a new API key at https://console.neon.tech/app/settings/api-keys",
-        "Make sure the key has access to the org that owns your projects",
-        "Paste it into Settings on this page",
+        "Sign in with Neon again to refresh the authorization",
+        "Make sure your Neon account has access to the organization that owns these projects",
       ],
       actions: [
-        { id: "open-settings", label: "Update Neon API key" },
-        { id: "open-neon-console", label: "Open Neon API keys" },
+        { id: "open-settings", label: "Sign in again" },
+        { id: "open-neon-console", label: "Open Neon Console" },
       ],
       severity: "error",
       code,

@@ -20,11 +20,7 @@ import {
   NoticeIcon,
   NoticeTitle,
 } from "@/components/ui/notice";
-import {
-  getNeonSettings,
-  getTargetOverride,
-  type TargetOverride,
-} from "@/lib/neon-settings";
+import { getTargetOverride, type TargetOverride } from "@/lib/neon-settings";
 import type { ImportAssistantStatus } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 
@@ -57,12 +53,10 @@ export default function ImportAssistantPage() {
     setPolling(true);
     setError(null);
     try {
-      const { apiKey } = getNeonSettings();
       const res = await fetch("/api/neon/import-assistant/status", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          apiKey,
           targetProjectId: override?.projectId,
           projectId: override?.projectId,
         }),

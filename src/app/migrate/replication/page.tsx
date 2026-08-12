@@ -15,14 +15,13 @@ import {
   Power,
   RefreshCw,
   Repeat,
-  Settings,
+  LogIn,
   Terminal,
   Trash2,
   Undo2,
   Zap,
 } from "lucide-react";
 import { useAssessment } from "@/components/AssessmentProvider";
-import { NeonSettingsModal } from "@/components/NeonSettingsModal";
 import { TargetProjectPicker } from "@/components/TargetProjectPicker";
 import { ClassifiedErrorBanner } from "@/components/ClassifiedErrorBanner";
 import { PageHeader, neon } from "@/components/ui";
@@ -39,10 +38,8 @@ import type {
   RecoveryActionId,
 } from "@/lib/neon-error-codes";
 import {
-  getNeonSettings,
   getSourceOverride,
   getTargetOverride,
-  hasNeonCredentials,
   type TargetOverride,
 } from "@/lib/neon-settings";
 import type {
@@ -63,6 +60,7 @@ interface NeonConfig {
   targetProjectId: string | null;
   hasSourceConnection: boolean;
   hasTargetConnection: boolean;
+  authenticated: boolean;
 }
 
 type Phase =
@@ -90,8 +88,6 @@ export default function ReplicationPage() {
   const [classifiedError, setClassifiedError] = useState<ClassifiedError | null>(
     null,
   );
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [hasKey, setHasKey] = useState(false);
   const [confirmEnable, setConfirmEnable] = useState(false);
   const [cutoverPre, setCutoverPre] = useState<CutoverPreflight | null>(null);
   const [cutoverResult, setCutoverResult] = useState<CutoverResult | null>(null);
@@ -120,8 +116,6 @@ export default function ReplicationPage() {
   // browser never receives or stores database passwords.
   const targetBody = () => {
     const body: Record<string, string> = {};
-    const { apiKey } = getNeonSettings();
-    if (apiKey) body.apiKey = apiKey;
     if (sourceOverride?.projectId) body.sourceProjectId = sourceOverride.projectId;
     if (targetOverride?.projectId) body.targetProjectId = targetOverride.projectId;
     return body;
@@ -143,10 +137,6 @@ export default function ReplicationPage() {
       .then(setCfg)
       .catch(() => setCfg(null));
   }, []);
-
-  useEffect(() => {
-    setHasKey(hasNeonCredentials());
-  }, [settingsOpen]);
 
   // Auto-poll status during monitoring phase
   const pollStatus = useCallback(async () => {
@@ -198,12 +188,10 @@ export default function ReplicationPage() {
     setPhase("enabling");
     setError(null);
     try {
-      const { apiKey } = getNeonSettings();
       const res = await fetch("/api/neon/replication/enable", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          apiKey,
           projectId: sourceProjectId,
         }),
       });
@@ -434,16 +422,15 @@ export default function ReplicationPage() {
         setConfirmEnable(true);
         return;
       case "open-settings":
-        setSettingsOpen(true);
-        return;
-      case "open-neon-console":
-        window.open(
-          "https://console.neon.tech/app/settings/api-keys",
-          "_blank",
+        window.location.assign(
+          `/api/auth/neon?returnTo=${encodeURIComponent(window.location.pathname)}`,
         );
         return;
+      case "open-neon-console":
+        window.open("https://console.neon.tech", "_blank");
+        return;
       case "use-unpooled-connection":
-        setSettingsOpen(true);
+        setError("Pick the project again so the app can resolve its direct endpoint.");
         return;
     }
   }
@@ -458,10 +445,16 @@ export default function ReplicationPage() {
     targetOverride?.projectId || cfg?.hasTargetConnection,
   );
 
-  const apiKeyAction = (
-    <Button size="lg" variant="outline" onClick={() => setSettingsOpen(true)}>
-      <Settings className="h-3.5 w-3.5" />
-      API key
+  const authenticated = Boolean(cfg?.authenticated);
+  const authAction = authenticated ? null : (
+    <Button
+      size="lg"
+      variant="outline"
+      nativeButton={false}
+      render={<a href="/api/auth/neon?returnTo=/migrate/replication" />}
+    >
+      <LogIn className="h-3.5 w-3.5" />
+      Sign in with Neon
     </Button>
   );
 
@@ -503,6 +496,20 @@ export default function ReplicationPage() {
     </div>
   );
 
+  const workloadNotice = (
+    <Notice tone="warning" className="mb-5">
+      <NoticeIcon>
+        <AlertTriangle />
+      </NoticeIcon>
+      <NoticeBody>
+        <NoticeTitle>Non-critical workloads only</NoticeTitle>
+        <NoticeDescription>
+          Use this tool for non-critical workloads up to 1 TB.
+        </NoticeDescription>
+      </NoticeBody>
+    </Notice>
+  );
+
   if (!sourceReady || !targetReady) {
     return (
       <div className={neon.page}>
@@ -510,9 +517,10 @@ export default function ReplicationPage() {
           <PageHeader
             title="Logical replication"
             subtitle="One-click logical replication setup between your source and target Neon projects"
-            actions={apiKeyAction}
+            actions={authAction}
           />
           {pickerRow}
+          {workloadNotice}
           <Notice tone="warning">
             <NoticeIcon>
               <AlertTriangle />
@@ -527,9 +535,8 @@ export default function ReplicationPage() {
               </NoticeTitle>
               <NoticeDescription>
                 Replication needs both sides. Choose them above and the app
-                fetches their direct connection strings from the Neon API. You
-                can also set NEON_SOURCE_CONNECTION_STRING and
-                NEON_TARGET_CONNECTION_STRING in .env.local.
+                fetches their direct connection strings from the Neon API for
+                your signed-in account.
               </NoticeDescription>
               <NoticeActions>
                 <Button
@@ -544,11 +551,6 @@ export default function ReplicationPage() {
               </NoticeActions>
             </NoticeBody>
           </Notice>
-          <NeonSettingsModal
-            open={settingsOpen}
-            onClose={() => setSettingsOpen(false)}
-            onSaved={() => setHasKey(hasNeonCredentials())}
-          />
         </div>
       </div>
     );
@@ -560,10 +562,11 @@ export default function ReplicationPage() {
         <PageHeader
           title="Logical replication"
           subtitle="Source → target setup, automated. Schema copy · publication · subscription · live lag monitoring."
-          actions={apiKeyAction}
+          actions={authAction}
         />
 
         {pickerRow}
+        {workloadNotice}
 
         {/* Brief overview, collapsible. Lands users oriented without
             forcing them to read a wall of text before they can act. */}
@@ -716,7 +719,7 @@ export default function ReplicationPage() {
               <div className="flex flex-col items-end gap-2">
                 <Button size="lg"
                   onClick={enableSourceLogicalReplication}
-                  disabled={!hasKey || phase === "enabling"}
+                  disabled={!authenticated || phase === "enabling"}
                   variant={confirmEnable ? "destructive" : "white"}
                 >
                   {phase === "enabling" ? (
@@ -736,9 +739,9 @@ export default function ReplicationPage() {
                     </>
                   )}
                 </Button>
-                {!hasKey && (
+                {!authenticated && (
                   <p className="text-label text-[#f59e0b]">
-                    Add a Neon API key in settings to enable
+                    Sign in with Neon to enable
                   </p>
                 )}
               </div>
@@ -1047,11 +1050,6 @@ export default function ReplicationPage() {
           )
         )}
 
-        <NeonSettingsModal
-          open={settingsOpen}
-          onClose={() => setSettingsOpen(false)}
-          onSaved={() => setHasKey(hasNeonCredentials())}
-        />
       </div>
     </div>
   );

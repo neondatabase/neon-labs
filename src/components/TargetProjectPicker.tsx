@@ -21,12 +21,9 @@ import {
   ProjectTicketName,
   ProjectTicketVersion,
 } from "./project-ticket";
-import { NeonSettingsModal } from "./NeonSettingsModal";
 import {
-  getNeonSettings,
   getSourceOverride,
   getTargetOverride,
-  hasNeonCredentials,
   setSourceOverride,
   setTargetOverride,
   type TargetOverride,
@@ -44,7 +41,7 @@ interface ServerConfig {
   orgName: string | null;
   sourceProjectId: string | null;
   targetProjectId: string | null;
-  hasApiKey: boolean;
+  authenticated: boolean;
 }
 
 /** Compact dropdown that lets the user pick which project in their org should
@@ -79,14 +76,10 @@ export function TargetProjectPicker({
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [hasKey, setHasKey] = useState(false);
   const [query, setQuery] = useState("");
 
   const isSource = role === "source";
-  /* The API key may live server-side in .env.local, in which case the routes
-     resolve it themselves and the browser never sees one. */
-  const keyAvailable = hasKey || Boolean(cfg?.hasApiKey);
+  const authenticated = Boolean(cfg?.authenticated);
   const readOverride = () =>
     isSource ? getSourceOverride() : getTargetOverride();
   const writeOverride = (v: TargetOverride | null) =>
@@ -94,7 +87,6 @@ export function TargetProjectPicker({
 
   useEffect(() => {
     setOverrideState(readOverride());
-    setHasKey(hasNeonCredentials());
     fetch("/api/neon/config")
       .then((r) => (r.ok ? r.json() : null))
       .then((c: ServerConfig | null) => setCfg(c))
@@ -103,14 +95,10 @@ export function TargetProjectPicker({
   }, [role]);
 
   async function refresh() {
-    if (!keyAvailable) {
-      setSettingsOpen(true);
-      return;
-    }
+    if (!authenticated) return;
     setLoading(true);
     setError(null);
     try {
-      const { apiKey } = getNeonSettings();
       // For source picker, exclude target so users can't pick the same project
       // on both sides. For target picker, exclude source (existing behavior).
       const excludeProjectId = isSource
@@ -120,7 +108,6 @@ export function TargetProjectPicker({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          apiKey,
           orgId: cfg?.orgId,
           excludeProjectId,
         }),
@@ -157,10 +144,7 @@ export function TargetProjectPicker({
   }
 
   async function createAndSelect() {
-    if (!keyAvailable) {
-      setSettingsOpen(true);
-      return;
-    }
+    if (!authenticated) return;
     const name = window.prompt(
       `New PG${targetPgVersion} project name:`,
       `upgrade-target-pg${targetPgVersion}-${new Date().toISOString().slice(0, 10)}`,
@@ -169,12 +153,10 @@ export function TargetProjectPicker({
     setCreating(true);
     setError(null);
     try {
-      const { apiKey } = getNeonSettings();
       const res = await fetch("/api/neon/create-target", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          apiKey,
           name,
           pgVersion: targetPgVersion,
           regionId: "aws-us-west-2",
@@ -217,7 +199,7 @@ export function TargetProjectPicker({
       <Popover
         open={open}
         onOpenChange={(next) => {
-          if (next && projects.length === 0 && keyAvailable) refresh();
+          if (next && projects.length === 0 && authenticated) refresh();
           setOpen(next);
         }}
       >
@@ -282,9 +264,15 @@ export function TargetProjectPicker({
             </div>
           </div>
 
-          {!keyAvailable ? (
+          {!authenticated ? (
             <div className="rounded-[4px] border border-[#f59e0b]/30 bg-[#f59e0b]/[0.08] p-3 text-label text-[#f59e0b]">
-              Add a Neon API key in settings to browse and pick projects.
+              <p>Sign in with Neon to browse and pick projects.</p>
+              <a
+                href="/api/auth/neon"
+                className="mt-2 inline-flex text-foreground underline underline-offset-2"
+              >
+                Sign in with Neon
+              </a>
             </div>
           ) : (
             <>
@@ -377,7 +365,7 @@ export function TargetProjectPicker({
                     onClick={clearOverride}
                     className="mt-1 w-full rounded-[4px] px-2 py-1.5 text-left text-caption text-[#9ca3af] hover:bg-[#1a1b1b] hover:text-foreground"
                   >
-                    Use env default ({envFallbackId ?? "—"})
+                    Clear selection
                   </button>
                 )}
               </div>
@@ -391,12 +379,6 @@ export function TargetProjectPicker({
           )}
         </PopoverContent>
       </Popover>
-
-      <NeonSettingsModal
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        onSaved={() => setHasKey(hasNeonCredentials())}
-      />
     </div>
   );
 }

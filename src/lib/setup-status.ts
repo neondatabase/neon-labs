@@ -12,15 +12,13 @@ export interface EnvConfig {
   targetProjectId: string | null;
   hasSourceConnection: boolean;
   hasTargetConnection: boolean;
-  hasApiKey: boolean;
+  authenticated: boolean;
+  oauthConfigured: boolean;
+  developmentFallback: boolean;
   sourceIsPooled: boolean;
 }
 
-export type RequirementId =
-  | "apiKey"
-  | "orgId"
-  | "sourceConnection"
-  | "sourceProject";
+export type RequirementId = "authentication";
 
 export interface Requirement {
   id: RequirementId;
@@ -59,38 +57,11 @@ export function setSetupSkipped(v: boolean) {
 export function buildRequirements(env: EnvConfig | null): Requirement[] {
   return [
     {
-      id: "apiKey",
-      envVar: "NEON_API_KEY",
-      label: "API key",
-      detail: "Lists your projects, provisions targets, enables replication.",
-      satisfied: Boolean(env?.hasApiKey),
-    },
-    {
-      id: "orgId",
-      envVar: "NEON_ORG_ID",
-      label: "org",
-      detail: "Scopes the project list. Personal accounts can leave it blank.",
-      satisfied: Boolean(env?.orgId),
-      optional: true,
-    },
-    {
-      id: "sourceProject",
-      envVar: "NEON_SOURCE_PROJECT_ID",
-      label: "default source",
-      detail: "Skips the project picker. Otherwise you choose one in the app.",
-      satisfied: Boolean(env?.sourceProjectId),
-      optional: true,
-    },
-    {
-      id: "sourceConnection",
-      envVar: "NEON_SOURCE_CONNECTION_STRING",
-      label: "direct connection",
-      detail: "Only if you'd rather not have the app fetch it from the API.",
-      satisfied: Boolean(env?.hasSourceConnection) && !env?.sourceIsPooled,
-      invalid: env?.sourceIsPooled
-        ? "Pooled host. Logical replication needs the direct endpoint: remove -pooler."
-        : undefined,
-      optional: true,
+      id: "authentication",
+      envVar: "Neon OAuth",
+      label: "account",
+      detail: "Sign in with Neon to choose projects and run assessments.",
+      satisfied: Boolean(env?.authenticated),
     },
   ];
 }

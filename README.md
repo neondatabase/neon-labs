@@ -8,71 +8,53 @@ Built against the live Neon API. Runs against your own Neon projects.
 
 ## What this is, what this isn't
 
-**Is:** a self-hosted Next.js app you clone and run locally. Talks to
-your Neon projects through your own credentials (a Neon API key plus
-your project connection strings).
+**Is:** a Next.js app that uses per-user Neon OAuth when hosted. It can
+also run locally with a development-only API key fallback.
 
-**Isn't:** a hosted service. There's no `app.example.com` to sign into,
-and there's no third-party server holding your tokens. Everything runs
-on your machine, against your Neon org.
+**Isn't:** a service that stores customer catalog data or shares one
+organization credential across visitors.
 
 ## What you'll need
 
 1. A **Neon account** with at least one source project you want to
    assess or upgrade ([sign up](https://neon.com))
-2. A **Neon API key** for that org ([generate one](https://console.neon.tech/app/settings/api-keys)).
-   For multi-tenant safety, use an **org-scoped API key** rather than
-   a personal one if you're testing this against shared projects.
+2. A **Neon OAuth client** for a hosted deployment, or a Neon API key
+   for local development only.
 3. Node.js 20+ and npm
-
-That's it. No OAuth client provisioning, no third-party service.
 
 ## Quick start
 
 ```bash
 git clone https://github.com/sav-maya/neon-pgupgrade-advisor.git
 cd neon-pgupgrade-advisor
-npm install --legacy-peer-deps
+npm install
 cp .env.example .env.local
-# add your NEON_API_KEY (see below)
+# add OAuth credentials, or NEON_API_KEY for local development only
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000).
 
-`NEON_API_KEY` is the only value the app needs. It lists your projects
-and fetches their connection strings on demand, server-side.
-
 ## Configuring `.env.local`
 
-Only `NEON_API_KEY` is required. Everything else is optional and just
-skips a picker.
-
 ```env
-# The only required value. Lists your projects and fetches their
-# connection strings on demand.
+# OAuth. Register http://localhost:3000/api/auth/callback/neon.
+APP_URL=http://localhost:3000
+NEON_OAUTH_CLIENT_ID=...
+NEON_OAUTH_CLIENT_SECRET=...
+SESSION_SECRET=at-least-32-random-characters
+
+# Local-development fallback only. Ignored in production.
 NEON_API_KEY=napi_...
-
-# Optional: skips the source project picker.
 NEON_SOURCE_PROJECT_ID=your-source-project-id
-
-# Optional override. Use the UNPOOLED host, no '-pooler' in the
-# hostname, so introspection hits a direct compute.
 NEON_SOURCE_CONNECTION_STRING=postgresql://neondb_owner:PASSWORD@ep-XXXX.region.aws.neon.tech/neondb?sslmode=require
-
-# Optional: scopes the project list to an org and names it in the sidebar.
 NEON_ORG_ID=org-...
 NEON_ORG_NAME=My Org
 ```
 
-**Where to find these values in the Neon Console:**
-
-| Variable | Where |
-|---|---|
-| `NEON_SOURCE_PROJECT_ID` | Project URL: `console.neon.tech/app/projects/<this-bit>` |
-| `NEON_SOURCE_CONNECTION_STRING` | Project → **Connect** button → copy the **direct** (not pooled) connection string |
-| `NEON_ORG_ID` | Settings → Organizations → copy `org-...` ID |
-| `NEON_ORG_NAME` | Just the display name |
+Generate `SESSION_SECRET` with `openssl rand -base64 32`. In production,
+set `APP_URL` to the stable custom domain, for example
+`https://labs.neon.com`.
 
 ## Features
 
@@ -97,38 +79,24 @@ migration yourself.
 
 ## Multi-user / sharing this with your team
 
-The cleanest path right now is **everyone clones their own copy** and
-points it at their own Neon org via their own `.env.local`. Their
-credentials never touch your machine and vice versa.
+The hosted app uses a separate Neon OAuth session for every visitor.
+A shared server-side API key is deliberately unsupported in production:
+it would make every visitor act as the owner of that key.
 
-A hosted multi-tenant version (labs.neon.com) needs a Neon partner
-OAuth client. A shared server-side API key won't do: every visitor
-would be acting as whoever owns that key, with read access to that
-org's projects and connection URIs.
-
-Two things in this repo assume single-tenant local use and need to
-move to per-user OAuth tokens before hosting:
-
-- `resolveApiKey()` falls back to the `NEON_API_KEY` environment
-  variable, which under OAuth should come from the session instead.
-- `NEON_SOURCE_CONNECTION_STRING` / `NEON_TARGET_CONNECTION_STRING`
-  let the server skip the Neon API entirely. Hosted, every connection
-  URI should be fetched per-request for the authorizing user.
-
-The read-only scopes are enough: projects read plus connection URI
-read. Nothing in the assessment flow writes.
+The OAuth client requests project read/create/update and organization
+read scopes. Assessment is read-only; migration tools need write scopes
+to create targets and enable logical replication after confirmation.
 
 ## Security notes
 
 - `.env.local` is gitignored. Don't commit it.
-- Until OAuth is wired, an API key pasted into the local-development
-  settings lives in `sessionStorage` and is cleared when the tab closes.
-  Legacy `localStorage` credentials are removed automatically. Hosted,
-  replace this fallback with an HttpOnly OAuth session.
-- Connection strings in `.env.local` are read by the Next.js server
-  process only. Project selection sends project ids; connection URIs are
-  resolved per request, never returned to the browser, and never cached
-  in application memory.
+- OAuth access and refresh tokens are encrypted in an HttpOnly,
+  `SameSite=Lax`, secure production cookie. The app has no session database.
+- `NEON_API_KEY` and direct connection-string environment fallbacks are
+  ignored in production.
+- Project selection sends project ids. Connection URIs are resolved
+  per request, never returned to the browser, and never cached in
+  application memory.
 - Assessment results live only in React memory and disappear on refresh.
   Neon API responses are marked `Cache-Control: no-store`; this app has no
   database, analytics sink, or server-side persistence for customer data.

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getProject } from "@/lib/neon-api";
-import { resolveApiKey } from "@/lib/neon-credentials";
+import { getOAuthAccessTokenFromSession } from "@/lib/neon-oauth";
 
 /* GET /api/neon/projects
    Returns the pre-configured source/target projects so the UI can render
@@ -11,10 +11,10 @@ import { resolveApiKey } from "@/lib/neon-credentials";
 
 async function pgVersionFor(projectId: string | undefined) {
   if (!projectId) return null;
-  const apiKey = resolveApiKey();
-  if (!apiKey) return null;
+  const accessToken = await getOAuthAccessTokenFromSession();
+  if (!accessToken) return null;
   try {
-    const { project } = await getProject(apiKey, projectId);
+    const { project } = await getProject(accessToken, projectId);
     return project.pg_version;
   } catch {
     return null;
@@ -22,15 +22,27 @@ async function pgVersionFor(projectId: string | undefined) {
 }
 
 export async function GET() {
-  const source = process.env.NEON_SOURCE_PROJECT_ID;
-  const target = process.env.NEON_TARGET_PROJECT_ID;
+  const source =
+    process.env.NODE_ENV !== "production"
+      ? process.env.NEON_SOURCE_PROJECT_ID
+      : undefined;
+  const target =
+    process.env.NODE_ENV !== "production"
+      ? process.env.NEON_TARGET_PROJECT_ID
+      : undefined;
   const [sourceVersion, targetVersion] = await Promise.all([
     pgVersionFor(source),
     pgVersionFor(target),
   ]);
   return NextResponse.json({
-    orgName: process.env.NEON_ORG_NAME ?? null,
-    orgId: process.env.NEON_ORG_ID ?? null,
+    orgName:
+      process.env.NODE_ENV !== "production"
+        ? (process.env.NEON_ORG_NAME ?? null)
+        : null,
+    orgId:
+      process.env.NODE_ENV !== "production"
+        ? (process.env.NEON_ORG_ID ?? null)
+        : null,
     projects: [
       source && {
         id: source,

@@ -3,7 +3,12 @@
 import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import Link from "next/link";
+import { LogOut } from "lucide-react";
 import { initials } from "@/lib/initials";
+import {
+  setSourceOverride,
+  setTargetOverride,
+} from "@/lib/neon-settings";
 
 const TITLES: Record<string, string> = {
   "/assess": "New assessment",
@@ -36,15 +41,37 @@ export function TopBar() {
   /* At a section root the section crumb already names the page. */
   const title = pathname === section?.href ? null : (TITLES[pathname] ?? null);
   const [orgName, setOrgName] = useState<string | null>(null);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [developmentFallback, setDevelopmentFallback] = useState(false);
 
   useEffect(() => {
     fetch("/api/neon/config")
       .then((r) => (r.ok ? r.json() : null))
-      .then((cfg: { orgName?: string | null } | null) =>
-        setOrgName(cfg?.orgName || null),
+      .then(
+        (
+          cfg: {
+            orgName?: string | null;
+            authenticated?: boolean;
+            developmentFallback?: boolean;
+          } | null,
+        ) => {
+          setOrgName(cfg?.orgName || null);
+          setAuthenticated(Boolean(cfg?.authenticated));
+          setDevelopmentFallback(Boolean(cfg?.developmentFallback));
+        },
       )
-      .catch(() => setOrgName(null));
+      .catch(() => {
+        setOrgName(null);
+        setAuthenticated(false);
+      });
   }, []);
+
+  async function signOut() {
+    await fetch("/api/auth/logout", { method: "POST" });
+    setSourceOverride(null);
+    setTargetOverride(null);
+    window.location.assign("/");
+  }
 
   return (
     <header className="sticky top-0 z-10 flex h-[52px] items-center justify-between border-b border-[#262727] bg-[#0c0d0d]/80 px-6 backdrop-blur">
@@ -72,6 +99,16 @@ export function TopBar() {
       </nav>
 
       <div className="flex items-center gap-2">
+        {authenticated && !developmentFallback && (
+          <button
+            type="button"
+            onClick={signOut}
+            className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-caption text-[#9ca3af] transition-colors duration-150 ease-out hover:bg-[#1a1b1b] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            Sign out
+          </button>
+        )}
         <div
           title={orgName ?? "Not connected"}
           className="ml-1 flex h-7 w-7 items-center justify-center rounded-full bg-[#00e599]/15 text-label font-medium text-[#00e599]"

@@ -24,7 +24,6 @@ import {
   NoticeTitle,
 } from "@/components/ui/notice";
 import {
-  getNeonSettings,
   getSourceOverride,
   getTargetOverride,
   type TargetOverride,
@@ -72,8 +71,6 @@ export default function DumpRestorePage() {
   // Send project ids only. The server resolves short-lived connection URIs.
   const targetBody = () => {
     const body: Record<string, string> = {};
-    const { apiKey } = getNeonSettings();
-    if (apiKey) body.apiKey = apiKey;
     if (sourceOverride?.projectId)
       body.sourceProjectId = sourceOverride.projectId;
     if (override?.projectId) body.targetProjectId = override.projectId;

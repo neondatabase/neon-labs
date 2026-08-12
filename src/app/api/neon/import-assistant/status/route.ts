@@ -14,7 +14,6 @@ import type { ImportAssistantStatus } from "@/lib/types";
 */
 export async function POST(request: NextRequest) {
   let body: {
-    apiKey?: string;
     targetConnectionString?: string;
     targetProjectId?: string;
     projectId?: string;
@@ -25,7 +24,11 @@ export async function POST(request: NextRequest) {
     /* allow empty */
   }
   const { target } = await resolveConnections(body);
-  const projectId = body.projectId || process.env.NEON_TARGET_PROJECT_ID;
+  const projectId =
+    body.projectId ||
+    (process.env.NODE_ENV !== "production"
+      ? process.env.NEON_TARGET_PROJECT_ID
+      : undefined);
   if (!target || !projectId) {
     return NextResponse.json(
       { error: "No target or projectId configured" },

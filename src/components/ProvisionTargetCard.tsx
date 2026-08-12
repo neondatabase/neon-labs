@@ -6,12 +6,10 @@ import {
   Copy,
   ExternalLink,
   Loader2,
-  Settings,
+  LogIn,
   Sparkles,
 } from "lucide-react";
 import { neon } from "./ui";
-import { NeonSettingsModal } from "./NeonSettingsModal";
-import { getNeonSettings, hasNeonCredentials } from "@/lib/neon-settings";
 import type { PgMajorVersion } from "@/lib/types";
 import { Button } from "./ui/button";
 import { Card } from "./ui/card";
@@ -22,6 +20,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 interface OrgConfig {
   orgId: string | null;
   orgName: string | null;
+  authenticated: boolean;
 }
 
 interface ProvisionResult {
@@ -63,8 +62,6 @@ export function ProvisionTargetCard({
   defaultNameHint?: string;
 }) {
   const [org, setOrg] = useState<OrgConfig | null>(null);
-  const [hasKey, setHasKey] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [name, setName] = useState("");
   const [region, setRegion] = useState(defaultRegion);
   const [busy, setBusy] = useState(false);
@@ -80,10 +77,6 @@ export function ProvisionTargetCard({
   }, []);
 
   useEffect(() => {
-    setHasKey(hasNeonCredentials());
-  }, [settingsOpen]);
-
-  useEffect(() => {
     if (!name) {
       const base = defaultNameHint?.toLowerCase().replace(/[^a-z0-9]+/g, "-") ?? "upgrade-target";
       setName(`${base}-pg${targetVersion}`);
@@ -97,12 +90,10 @@ export function ProvisionTargetCard({
     setError(null);
     setResult(null);
     try {
-      const { apiKey } = getNeonSettings();
       const res = await fetch("/api/neon/create-target", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          apiKey,
           name,
           pgVersion: targetVersion,
           regionId: region,
@@ -145,10 +136,17 @@ export function ProvisionTargetCard({
             or logical replication.
           </p>
         </div>
-        <Button size="lg" variant="ghost" onClick={() => setSettingsOpen(true)}>
-          <Settings className="h-3.5 w-3.5" />
-          API key
-        </Button>
+        {!org?.authenticated && (
+          <Button
+            size="lg"
+            variant="ghost"
+            nativeButton={false}
+            render={<a href="/api/auth/neon" />}
+          >
+            <LogIn className="h-3.5 w-3.5" />
+            Sign in with Neon
+          </Button>
+        )}
       </div>
 
       {/* Form */}
@@ -196,16 +194,16 @@ export function ProvisionTargetCard({
 
       <div className="mt-5 flex items-center justify-between">
         <p className="text-label text-[#9ca3af]">
-          {hasKey ? (
-            <span className="text-[#00e599]">● API key configured</span>
+          {org?.authenticated ? (
+            <span className="text-[#00e599]">● Signed in with Neon</span>
           ) : (
-            "Add a Neon API key to provision"
+            "Sign in with Neon to provision"
           )}
         </p>
         <Button size="lg" variant="white"
           onClick={() => {
-            if (!hasKey) {
-              setSettingsOpen(true);
+            if (!org?.authenticated) {
+              window.location.assign("/api/auth/neon");
               return;
             }
             provision();
@@ -289,11 +287,6 @@ export function ProvisionTargetCard({
         </div>
       )}
 
-      <NeonSettingsModal
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        onSaved={() => setHasKey(hasNeonCredentials())}
-      />
     </Card>
   );
 }

@@ -14,11 +14,7 @@ import { TargetProjectPicker } from "@/components/TargetProjectPicker";
 import { PageHeader, SelectCard, neon } from "@/components/ui";
 import { NEON_SUPPORTED_VERSIONS, type PgMajorVersion } from "@/lib/types";
 import { changesForUpgrade } from "@/lib/version-changes";
-import {
-  getNeonSettings,
-  getSourceOverride,
-  type TargetOverride,
-} from "@/lib/neon-settings";
+import { getSourceOverride, type TargetOverride } from "@/lib/neon-settings";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
@@ -156,12 +152,10 @@ export default function NewAssessmentPage() {
     setAnalyzing(true);
     setError(null);
     try {
-      const { apiKey } = getNeonSettings();
       const res = await fetch("/api/neon/assessment", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          apiKey,
           source: "env",
           // Server re-introspects the source's actual version. We pass the
           // client-side guess as a hint, but server reads pg_settings directly.

@@ -32,13 +32,13 @@ export interface NeonEndpoint {
 
 async function neonFetch<T>(
   path: string,
-  apiKey: string,
+  accessToken: string,
   init: RequestInit = {},
 ): Promise<T> {
   const res = await fetch(`${NEON_API_BASE}${path}`, {
     ...init,
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${accessToken}`,
       Accept: "application/json",
       "Content-Type": "application/json",
       ...(init.headers ?? {}),
@@ -51,14 +51,17 @@ async function neonFetch<T>(
   return (await res.json()) as T;
 }
 
-export async function getProject(apiKey: string, projectId: string) {
-  return neonFetch<{ project: NeonProject }>(`/projects/${projectId}`, apiKey);
+export async function getProject(accessToken: string, projectId: string) {
+  return neonFetch<{ project: NeonProject }>(
+    `/projects/${projectId}`,
+    accessToken,
+  );
 }
 
-export async function getOrganization(apiKey: string, orgId: string) {
+export async function getOrganization(accessToken: string, orgId: string) {
   return neonFetch<{ id: string; name: string }>(
     `/organizations/${orgId}`,
-    apiKey,
+    accessToken,
   );
 }
 
@@ -67,10 +70,10 @@ export interface NeonOrganization {
   name: string;
 }
 
-export async function listOrganizations(apiKey: string) {
+export async function listOrganizations(accessToken: string) {
   return neonFetch<{ organizations: NeonOrganization[] }>(
     "/users/me/organizations",
-    apiKey,
+    accessToken,
   );
 }
 
@@ -80,7 +83,7 @@ export interface ListProjectsResponse {
 }
 
 export async function listProjects(
-  apiKey: string,
+  accessToken: string,
   opts: { orgId?: string; limit?: number } = {},
 ) {
   const params = new URLSearchParams();
@@ -89,24 +92,24 @@ export async function listProjects(
   const qs = params.toString();
   return neonFetch<ListProjectsResponse>(
     `/projects${qs ? `?${qs}` : ""}`,
-    apiKey,
+    accessToken,
   );
 }
 
 /* Neon rejects an org-less GET /projects with "org_id is required", so when
-   the caller has no org configured, fan out over the orgs the key can see.
+   the caller has no org configured, fan out over the orgs the user can see.
    One unreachable org shouldn't blank the whole picker, so failures are
    dropped rather than propagated. */
 export async function listProjectsAcrossOrgs(
-  apiKey: string,
+  accessToken: string,
   opts: { orgId?: string; limit?: number } = {},
 ): Promise<ListProjectsResponse> {
-  if (opts.orgId) return listProjects(apiKey, opts);
+  if (opts.orgId) return listProjects(accessToken, opts);
 
-  const { organizations } = await listOrganizations(apiKey);
+  const { organizations } = await listOrganizations(accessToken);
   const results = await Promise.allSettled(
     organizations.map((org) =>
-      listProjects(apiKey, { orgId: org.id, limit: opts.limit }),
+      listProjects(accessToken, { orgId: org.id, limit: opts.limit }),
     ),
   );
   const projects = results.flatMap((r) =>
@@ -116,7 +119,7 @@ export async function listProjectsAcrossOrgs(
 }
 
 export async function getConnectionUri(
-  apiKey: string,
+  accessToken: string,
   projectId: string,
   opts: {
     branchId?: string;
@@ -132,32 +135,39 @@ export async function getConnectionUri(
   if (opts.pooled !== undefined) params.set("pooled", String(opts.pooled));
   return neonFetch<{ uri: string }>(
     `/projects/${projectId}/connection_uri${params.toString() ? `?${params.toString()}` : ""}`,
-    apiKey,
+    accessToken,
   );
 }
 
 export async function listDatabases(
-  apiKey: string,
+  accessToken: string,
   projectId: string,
   branchId: string,
 ) {
   return neonFetch<{
     databases: { name: string; owner_name: string }[];
-  }>(`/projects/${projectId}/branches/${branchId}/databases`, apiKey);
+  }>(`/projects/${projectId}/branches/${branchId}/databases`, accessToken);
 }
 
 /* The connection_uri endpoint rejects requests without database_name and
    role_name, so discover the default branch's first database and its owner
    before asking. pooled stays false: logical replication and pg_dump need the
    direct compute, not the pooler. */
-export async function resolveConnectionUri(apiKey: string, projectId: string) {
-  const { branches } = await listBranches(apiKey, projectId);
+export async function resolveConnectionUri(
+  accessToken: string,
+  projectId: string,
+) {
+  const { branches } = await listBranches(accessToken, projectId);
   const branch = branches.find((b) => b.default) ?? branches[0];
   if (!branch) throw new Error(`Project ${projectId} has no branches`);
-  const { databases } = await listDatabases(apiKey, projectId, branch.id);
+  const { databases } = await listDatabases(
+    accessToken,
+    projectId,
+    branch.id,
+  );
   const database = databases[0];
   if (!database) throw new Error(`Branch ${branch.id} has no databases`);
-  const { uri } = await getConnectionUri(apiKey, projectId, {
+  const { uri } = await getConnectionUri(accessToken, projectId, {
     branchId: branch.id,
     databaseName: database.name,
     roleName: database.owner_name,
@@ -166,10 +176,10 @@ export async function resolveConnectionUri(apiKey: string, projectId: string) {
   return uri;
 }
 
-export async function listBranches(apiKey: string, projectId: string) {
+export async function listBranches(accessToken: string, projectId: string) {
   return neonFetch<{ branches: NeonBranch[] }>(
     `/projects/${projectId}/branches`,
-    apiKey,
+    accessToken,
   );
 }
 
@@ -179,14 +189,14 @@ export interface CreateBranchParams {
 }
 
 export async function createBranch(
-  apiKey: string,
+  accessToken: string,
   projectId: string,
   params: CreateBranchParams,
 ) {
   return neonFetch<{
     branch: NeonBranch;
     endpoints: NeonEndpoint[];
-  }>(`/projects/${projectId}/branches`, apiKey, {
+  }>(`/projects/${projectId}/branches`, accessToken, {
     method: "POST",
     body: JSON.stringify({
       branch: {
@@ -199,13 +209,13 @@ export async function createBranch(
 }
 
 export async function deleteBranch(
-  apiKey: string,
+  accessToken: string,
   projectId: string,
   branchId: string,
 ) {
   return neonFetch<{ branch: NeonBranch }>(
     `/projects/${projectId}/branches/${branchId}`,
-    apiKey,
+    accessToken,
     { method: "DELETE" },
   );
 }
@@ -230,7 +240,7 @@ export interface CreateProjectResult {
 }
 
 export async function createProject(
-  apiKey: string,
+  accessToken: string,
   params: CreateProjectParams,
 ): Promise<CreateProjectResult> {
   const body: Record<string, unknown> = {
@@ -241,7 +251,7 @@ export async function createProject(
       ...(params.orgId ? { org_id: params.orgId } : {}),
     },
   };
-  return neonFetch<CreateProjectResult>("/projects", apiKey, {
+  return neonFetch<CreateProjectResult>("/projects", accessToken, {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -251,12 +261,12 @@ export async function createProject(
     IMPORTANT: irreversible, wal_level switches to logical permanently
     and all computes restart. Caller should confirm with user first. */
 export async function enableLogicalReplication(
-  apiKey: string,
+  accessToken: string,
   projectId: string,
 ) {
   return neonFetch<{ project: NeonProject }>(
     `/projects/${projectId}`,
-    apiKey,
+    accessToken,
     {
       method: "PATCH",
       body: JSON.stringify({

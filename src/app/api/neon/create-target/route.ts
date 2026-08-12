@@ -1,16 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createProject } from "@/lib/neon-api";
-import { MISSING_API_KEY_ERROR, resolveApiKey } from "@/lib/neon-credentials";
+import { MISSING_AUTH_ERROR } from "@/lib/neon-credentials";
+import { getOAuthAccessTokenFromSession } from "@/lib/neon-oauth";
 
 /* POST /api/neon/create-target
-   body: { apiKey, name, pgVersion, regionId?, orgId? }
+   body: { name, pgVersion, regionId?, orgId? }
    Creates a new Neon project in the user's org at the target PG version.
    Returns project metadata only. Routes resolve connection URIs server-side
    from the project id when they need one.
 */
 export async function POST(request: NextRequest) {
   let body: {
-    apiKey?: string;
     name?: string;
     pgVersion?: number;
     regionId?: string;
@@ -22,9 +22,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const apiKey = resolveApiKey(body.apiKey);
-  if (!apiKey) {
-    return NextResponse.json({ error: MISSING_API_KEY_ERROR }, { status: 400 });
+  const accessToken = await getOAuthAccessTokenFromSession();
+  if (!accessToken) {
+    return NextResponse.json({ error: MISSING_AUTH_ERROR }, { status: 401 });
   }
   if (!body.name) {
     return NextResponse.json({ error: "name is required" }, { status: 400 });
@@ -33,7 +33,7 @@ export async function POST(request: NextRequest) {
   const orgId = body.orgId || process.env.NEON_ORG_ID || undefined;
 
   try {
-    const result = await createProject(apiKey, {
+    const result = await createProject(accessToken, {
       name: body.name,
       pgVersion: body.pgVersion,
       regionId: body.regionId,

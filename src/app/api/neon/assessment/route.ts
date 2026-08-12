@@ -14,7 +14,6 @@ const NO_STORE = { "Cache-Control": "private, no-store, max-age=0" };
 /* POST /api/neon/assessment
    body: {
      source?: "env" | <connection-string>,
-     apiKey?: string,
      sourceConnectionString?: string,
      sourceProjectId?: string,
      targetVersion?: number,
@@ -32,7 +31,6 @@ const NO_STORE = { "Cache-Control": "private, no-store, max-age=0" };
 export async function POST(request: NextRequest) {
   let body: {
     source?: string;
-    apiKey?: string;
     sourceConnectionString?: string;
     sourceProjectId?: string;
     targetVersion?: number;
@@ -51,7 +49,6 @@ export async function POST(request: NextRequest) {
   }
 
   const { source: conn } = await resolveConnections({
-    apiKey: body.apiKey,
     sourceConnectionString:
       body.sourceConnectionString ||
       (body.source && body.source !== "env" ? body.source : undefined),

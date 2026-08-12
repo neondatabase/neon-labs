@@ -1,30 +1,26 @@
 import { resolveConnectionUri } from "@/lib/neon-api";
+import { getOAuthAccessTokenFromSession } from "@/lib/neon-oauth";
 
-export function resolveApiKey(fromBody?: string | null): string | null {
-  const env = process.env.NEON_API_KEY?.trim();
-  if (env) return env;
-  const body = fromBody?.trim();
-  return body ? body : null;
-}
-
-export const MISSING_API_KEY_ERROR =
-  "No Neon API key. Set NEON_API_KEY in .env.local and restart the server, or add one under Neon connection settings.";
+export const MISSING_AUTH_ERROR =
+  "Sign in with Neon to access projects and connection details.";
 
 export const MISSING_CONNECTIONS_ERROR =
-  "Could not resolve connection strings. Set NEON_API_KEY in .env.local so the app can fetch them, pick source and target projects in the app, or set NEON_SOURCE_CONNECTION_STRING and NEON_TARGET_CONNECTION_STRING directly.";
+  "Could not resolve database connections. Sign in with Neon and pick the required projects.";
 
-async function connectionUriForProject(apiKey: string, projectId: string) {
+async function connectionUriForProject(
+  accessToken: string,
+  projectId: string,
+) {
   try {
     /* Do not cache database credentials in application memory. Resolve them
        only for the request that needs them. */
-    return await resolveConnectionUri(apiKey, projectId);
+    return await resolveConnectionUri(accessToken, projectId);
   } catch {
     return null;
   }
 }
 
 export interface ConnectionOverrides {
-  apiKey?: string | null;
   sourceConnectionString?: string | null;
   sourceProjectId?: string | null;
   targetConnectionString?: string | null;
@@ -41,34 +37,42 @@ export interface ResolvedConnections {
 export async function resolveConnections(
   overrides: ConnectionOverrides = {},
 ): Promise<ResolvedConnections> {
+  /* Hosted requests may select projects only by id. Accepting arbitrary
+     connection strings would turn these routes into an SSRF surface. Direct
+     strings remain available for local development only. */
+  const allowDirectConnections = process.env.NODE_ENV !== "production";
   const source =
-    overrides.sourceConnectionString?.trim() ||
-    process.env.NEON_SOURCE_CONNECTION_STRING ||
+    (allowDirectConnections &&
+      (overrides.sourceConnectionString?.trim() ||
+        process.env.NEON_SOURCE_CONNECTION_STRING)) ||
     null;
   const target =
-    overrides.targetConnectionString?.trim() ||
-    process.env.NEON_TARGET_CONNECTION_STRING ||
+    (allowDirectConnections &&
+      (overrides.targetConnectionString?.trim() ||
+        process.env.NEON_TARGET_CONNECTION_STRING)) ||
     null;
   if (source && target) return { source, target };
 
-  const apiKey = resolveApiKey(overrides.apiKey);
-  if (!apiKey) return { source, target };
+  const accessToken = await getOAuthAccessTokenFromSession();
+  if (!accessToken) return { source, target };
 
   const sourceProjectId =
-    overrides.sourceProjectId?.trim() || process.env.NEON_SOURCE_PROJECT_ID;
+    overrides.sourceProjectId?.trim() ||
+    (allowDirectConnections ? process.env.NEON_SOURCE_PROJECT_ID : undefined);
   const targetProjectId =
-    overrides.targetProjectId?.trim() || process.env.NEON_TARGET_PROJECT_ID;
+    overrides.targetProjectId?.trim() ||
+    (allowDirectConnections ? process.env.NEON_TARGET_PROJECT_ID : undefined);
 
   const [resolvedSource, resolvedTarget] = await Promise.all([
     source
       ? Promise.resolve(source)
       : sourceProjectId
-        ? connectionUriForProject(apiKey, sourceProjectId)
+        ? connectionUriForProject(accessToken, sourceProjectId)
         : Promise.resolve(null),
     target
       ? Promise.resolve(target)
       : targetProjectId
-        ? connectionUriForProject(apiKey, targetProjectId)
+        ? connectionUriForProject(accessToken, targetProjectId)
         : Promise.resolve(null),
   ]);
 
