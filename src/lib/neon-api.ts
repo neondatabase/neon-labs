@@ -81,11 +81,12 @@ export interface ListProjectsResponse {
 
 export async function listProjects(
   apiKey: string,
-  opts: { orgId?: string; limit?: number } = {},
+  opts: { orgId?: string; limit?: number; cursor?: string } = {},
 ) {
   const params = new URLSearchParams();
   if (opts.orgId) params.set("org_id", opts.orgId);
   if (opts.limit) params.set("limit", String(opts.limit));
+  if (opts.cursor) params.set("cursor", opts.cursor);
   const qs = params.toString();
   return neonFetch<ListProjectsResponse>(
     `/projects${qs ? `?${qs}` : ""}`,
@@ -93,26 +94,101 @@ export async function listProjects(
   );
 }
 
+async function listAllProjects(
+  apiKey: string,
+  opts: { orgId: string; limit?: number },
+) {
+  const projects: NeonProject[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+
+  do {
+    const page = await listProjects(apiKey, { ...opts, cursor });
+    projects.push(...page.projects);
+    const next = page.pagination?.cursor;
+    cursor = next && !seenCursors.has(next) ? next : undefined;
+    if (cursor) seenCursors.add(cursor);
+  } while (cursor);
+
+  return projects;
+}
+
+export interface NeonOrganizationProjects {
+  organization: NeonOrganization;
+  projects: NeonProject[];
+}
+
+export interface FailedNeonOrganization {
+  id: string;
+  name: string;
+}
+
+export interface ListProjectsAcrossOrgsResponse extends ListProjectsResponse {
+  organizations: NeonOrganizationProjects[];
+  failedOrganizations: FailedNeonOrganization[];
+}
+
 /* Neon rejects an org-less GET /projects with "org_id is required", so when
    the caller has no org configured, fan out over the orgs the key can see.
    One unreachable org shouldn't blank the whole picker, so failures are
-   dropped rather than propagated. */
+   reported alongside the successful groups. */
 export async function listProjectsAcrossOrgs(
   apiKey: string,
   opts: { orgId?: string; limit?: number } = {},
-): Promise<ListProjectsResponse> {
-  if (opts.orgId) return listProjects(apiKey, opts);
+): Promise<ListProjectsAcrossOrgsResponse> {
+  if (opts.orgId) {
+    const [organization, projects] = await Promise.all([
+      getOrganization(apiKey, opts.orgId).catch(() => ({
+        id: opts.orgId!,
+        name: opts.orgId!,
+      })),
+      listAllProjects(apiKey, {
+        orgId: opts.orgId,
+        limit: opts.limit,
+      }),
+    ]);
+    const group = {
+      organization,
+      projects: projects.toSorted((a, b) => a.name.localeCompare(b.name)),
+    };
+    return {
+      organizations: [group],
+      failedOrganizations: [],
+      projects: group.projects,
+    };
+  }
 
   const { organizations } = await listOrganizations(apiKey);
   const results = await Promise.allSettled(
     organizations.map((org) =>
-      listProjects(apiKey, { orgId: org.id, limit: opts.limit }),
+      listAllProjects(apiKey, { orgId: org.id, limit: opts.limit }),
     ),
   );
-  const projects = results.flatMap((r) =>
-    r.status === "fulfilled" ? r.value.projects : [],
+  const groups: NeonOrganizationProjects[] = [];
+  const failedOrganizations: FailedNeonOrganization[] = [];
+
+  results.forEach((result, index) => {
+    const organization = organizations[index];
+    if (result.status === "fulfilled") {
+      groups.push({
+        organization,
+        projects: result.value.toSorted((a, b) =>
+          a.name.localeCompare(b.name),
+        ),
+      });
+    } else {
+      failedOrganizations.push(organization);
+    }
+  });
+
+  groups.sort((a, b) =>
+    a.organization.name.localeCompare(b.organization.name),
   );
-  return { projects };
+  return {
+    organizations: groups,
+    failedOrganizations,
+    projects: groups.flatMap((group) => group.projects),
+  };
 }
 
 export async function getConnectionUri(

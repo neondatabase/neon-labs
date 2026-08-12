@@ -46,14 +46,26 @@ export async function preflight(
     const srcTables = await src.query<{ schema: string; table: string }>(`
       SELECT n.nspname AS schema, c.relname AS table
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'r' AND n.nspname = 'public'
+      WHERE c.relkind = 'r'
+        AND n.nspname <> 'information_schema'
+        AND n.nspname !~ '^pg_'
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.objid = c.oid AND d.deptype = 'e'
+        )
       ORDER BY 1, 2
     `);
     const noPK = await src.query<{ schema: string; table: string }>(`
       SELECT n.nspname AS schema, c.relname AS table
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'r' AND n.nspname = 'public'
+      WHERE c.relkind = 'r'
+        AND n.nspname <> 'information_schema'
+        AND n.nspname !~ '^pg_'
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.objid = c.oid AND d.deptype = 'e'
+        )
         AND NOT EXISTS (
           SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary
         )
@@ -62,10 +74,17 @@ export async function preflight(
       "SELECT rolname, rolreplication FROM pg_roles WHERE rolname = current_user",
     );
 
-    const tgtTables = await tgt.query<{ n: string }>(`
-      SELECT count(*)::text AS n FROM pg_class c
+    const tgtTables = await tgt.query<{ schema: string; table: string }>(`
+      SELECT n.nspname AS schema, c.relname AS table
+      FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'r' AND n.nspname = 'public'
+      WHERE c.relkind = 'r'
+        AND n.nspname <> 'information_schema'
+        AND n.nspname !~ '^pg_'
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.objid = c.oid AND d.deptype = 'e'
+        )
     `);
     const existingSub = await tgt.query<{ subname: string }>(
       "SELECT subname FROM pg_subscription WHERE subname = $1",
@@ -75,9 +94,14 @@ export async function preflight(
     const walLevel = srcVersion.wal;
     const logicalEnabled = walLevel === "logical";
     const tableCount = srcTables.rows.length;
+    const tables = srcTables.rows.map((r) => `${r.schema}.${r.table}`);
     const tablesWithoutPK = noPK.rows.map((r) => `${r.schema}.${r.table}`);
-    const targetSchemaTableCount = parseInt(tgtTables.rows[0].n, 10);
-    const targetSchemaLoaded = targetSchemaTableCount >= tableCount && tableCount > 0;
+    const targetTables = new Set(
+      tgtTables.rows.map((r) => `${r.schema}.${r.table}`),
+    );
+    const targetSchemaTableCount = targetTables.size;
+    const targetSchemaLoaded =
+      tableCount > 0 && tables.every((table) => targetTables.has(table));
 
     const blockers: string[] = [];
     const warnings: string[] = [];
@@ -116,6 +140,7 @@ export async function preflight(
         walLevel,
         logicalReplicationEnabled: logicalEnabled,
         tableCount,
+        tables,
         tablesWithoutPK,
         roleHasReplication: !!repRole.rows[0]?.rolreplication,
         rolname: srcVersion.user,
@@ -170,7 +195,35 @@ async function copySchemaIfNeeded(
   const tgt = new Client({ connectionString: unpool(targetConn) });
   await Promise.all([src.connect(), tgt.connect()]);
   try {
-    // 1. Extensions
+    // 1. User-defined schemas. Logical replication is database-wide, not
+    //    limited to `public`, so preserve every non-system schema containing
+    //    a user table or sequence.
+    const schemas = await src.query<{ schema: string }>(`
+      SELECT DISTINCT n.nspname AS schema
+      FROM pg_namespace n
+      JOIN pg_class c ON c.relnamespace = n.oid
+      WHERE c.relkind IN ('r', 'S')
+        AND n.nspname <> 'information_schema'
+        AND n.nspname !~ '^pg_'
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.objid = c.oid AND d.deptype = 'e'
+        )
+      ORDER BY 1
+    `);
+    for (const { schema } of schemas.rows) {
+      try {
+        await tgt.query(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
+      } catch (err) {
+        report.tablesFailed.push({
+          name: `${schema} (schema)`,
+          error: err instanceof Error ? err.message : String(err),
+          ddl: `CREATE SCHEMA IF NOT EXISTS "${schema}"`,
+        });
+      }
+    }
+
+    // 2. Extensions
     const exts = await src.query<{ extname: string }>(
       "SELECT extname FROM pg_extension WHERE extname NOT IN ('plpgsql') ORDER BY extname",
     );
@@ -186,13 +239,15 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 2. Sequences first, column defaults like nextval('foo_id_seq'::regclass)
+    // 3. Sequences first, column defaults like nextval('foo_id_seq'::regclass)
     //    will fail if the sequence doesn't exist on the target.
     const sequences = await src.query<{ schema: string; seq: string }>(`
       SELECT n.nspname AS schema, c.relname AS seq
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'S' AND n.nspname = 'public'
+      WHERE c.relkind = 'S'
+        AND n.nspname <> 'information_schema'
+        AND n.nspname !~ '^pg_'
         AND NOT EXISTS (
           SELECT 1 FROM pg_depend d
           WHERE d.objid = c.oid AND d.deptype = 'e'
@@ -213,14 +268,15 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 3. Tables (user tables only, exclude tables owned by extensions like
+    // 4. Tables (user tables only, exclude tables owned by extensions like
     //    pg_stat_statements).
     const tables = await src.query<{ schema: string; table: string }>(`
       SELECT n.nspname AS schema, c.relname AS table
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind = 'r'
-        AND n.nspname = 'public'
+        AND n.nspname <> 'information_schema'
+        AND n.nspname !~ '^pg_'
         AND NOT EXISTS (
           SELECT 1 FROM pg_depend d
           WHERE d.objid = c.oid AND d.deptype = 'e'
@@ -291,7 +347,7 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 4. Indexes (non-PK, since PKs were inlined above).
+    // 5. Indexes (non-PK, since PKs were inlined above).
     //    Use pg_get_indexdef() which produces fully qualified, valid DDL.
     const indexes = await src.query<{ indexname: string; indexdef: string }>(`
       SELECT i.indexrelid::regclass::text AS indexname,
@@ -299,7 +355,8 @@ async function copySchemaIfNeeded(
       FROM pg_index i
       JOIN pg_class c ON c.oid = i.indrelid
       JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = 'public'
+      WHERE n.nspname <> 'information_schema'
+        AND n.nspname !~ '^pg_'
         AND NOT i.indisprimary
         AND NOT i.indisunique
         AND NOT EXISTS (

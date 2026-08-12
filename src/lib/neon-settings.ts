@@ -96,6 +96,34 @@ export interface TargetOverride {
   projectName: string;
   pgVersion: number;
   regionId: string;
+  /** Present for multi-organization selections. Optional so project choices
+      stored by older app versions remain valid. */
+  orgId?: string;
+  orgName?: string;
+}
+
+function parseProjectOverride(raw: string): TargetOverride | null {
+  try {
+    const value = JSON.parse(raw) as Partial<TargetOverride>;
+    if (
+      typeof value.projectId !== "string" ||
+      typeof value.projectName !== "string" ||
+      typeof value.pgVersion !== "number" ||
+      typeof value.regionId !== "string"
+    ) {
+      return null;
+    }
+    return {
+      projectId: value.projectId,
+      projectName: value.projectName,
+      pgVersion: value.pgVersion,
+      regionId: value.regionId,
+      ...(typeof value.orgId === "string" ? { orgId: value.orgId } : {}),
+      ...(typeof value.orgName === "string" ? { orgName: value.orgName } : {}),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function getTargetOverride(): TargetOverride | null {
@@ -104,11 +132,7 @@ export function getTargetOverride(): TargetOverride | null {
   clearPersistedNeonSecrets();
   const raw = storage.getItem(KEY_TARGET_OVERRIDE);
   if (!raw) return null;
-  try {
-    return JSON.parse(raw) as TargetOverride;
-  } catch {
-    return null;
-  }
+  return parseProjectOverride(raw);
 }
 
 export function setTargetOverride(t: TargetOverride | null) {
@@ -128,11 +152,7 @@ export function getSourceOverride(): SourceOverride | null {
   clearPersistedNeonSecrets();
   const raw = storage.getItem(KEY_SOURCE_OVERRIDE);
   if (!raw) return null;
-  try {
-    return JSON.parse(raw) as SourceOverride;
-  } catch {
-    return null;
-  }
+  return parseProjectOverride(raw);
 }
 
 export function setSourceOverride(t: SourceOverride | null) {

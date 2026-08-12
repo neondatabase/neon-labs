@@ -25,7 +25,10 @@ export async function POST(request: NextRequest) {
     /* allow empty */
   }
   const { target } = await resolveConnections(body);
-  const projectId = body.projectId || process.env.NEON_TARGET_PROJECT_ID;
+  const projectId =
+    body.projectId ||
+    body.targetProjectId ||
+    process.env.NEON_TARGET_PROJECT_ID;
   if (!target || !projectId) {
     return NextResponse.json(
       { error: "No target or projectId configured" },
