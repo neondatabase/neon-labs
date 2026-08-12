@@ -30,7 +30,11 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "name is required" }, { status: 400 });
   }
 
-  const orgId = body.orgId || process.env.NEON_ORG_ID || undefined;
+  const orgId =
+    body.orgId ||
+    (process.env.NODE_ENV !== "production"
+      ? process.env.NEON_ORG_ID
+      : undefined);
 
   try {
     const result = await createProject(accessToken, {
