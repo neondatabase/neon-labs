@@ -3,10 +3,8 @@ import { listProjectsAcrossOrgs } from "@/lib/neon-api";
 import { MISSING_API_KEY_ERROR, resolveApiKey } from "@/lib/neon-credentials";
 
 /* POST /api/neon/projects/list
-   body: { apiKey, orgId?, role? }
-   Returns the full list of projects in the org. `role` is optional metadata
-   to mark which one is currently the source (excluded from picker).
-*/
+   body: { apiKey, orgId?, excludeProjectId? }
+   Returns projects grouped by organization for the multi-org picker. */
 export async function POST(request: NextRequest) {
   let body: { apiKey?: string; orgId?: string; excludeProjectId?: string };
   try {
@@ -21,16 +19,25 @@ export async function POST(request: NextRequest) {
   const orgId = body.orgId || process.env.NEON_ORG_ID || undefined;
   try {
     const result = await listProjectsAcrossOrgs(apiKey, { orgId, limit: 100 });
-    const projects = result.projects
-      .filter((p) => p.id !== body.excludeProjectId)
-      .map((p) => ({
-        id: p.id,
-        name: p.name,
-        pg_version: p.pg_version,
-        region_id: p.region_id,
-        org_id: p.org_id,
-      }));
-    return NextResponse.json({ projects });
+    const organizations = result.organizations.map((group) => ({
+      id: group.organization.id,
+      name: group.organization.name,
+      projects: group.projects
+        .filter((project) => project.id !== body.excludeProjectId)
+        .map((project) => ({
+          id: project.id,
+          name: project.name,
+          pg_version: project.pg_version,
+          region_id: project.region_id,
+          org_id: project.org_id ?? group.organization.id,
+          org_name: group.organization.name,
+        })),
+    }));
+    return NextResponse.json({
+      organizations,
+      failedOrganizations: result.failedOrganizations,
+      projects: organizations.flatMap((organization) => organization.projects),
+    });
   } catch (e) {
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "List failed" },

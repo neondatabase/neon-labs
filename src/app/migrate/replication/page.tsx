@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import Link from "next/link";
 import {
   AlertOctagon,
   AlertTriangle,
@@ -28,7 +27,6 @@ import { ClassifiedErrorBanner } from "@/components/ClassifiedErrorBanner";
 import { PageHeader, neon } from "@/components/ui";
 import {
   Notice,
-  NoticeActions,
   NoticeBody,
   NoticeDescription,
   NoticeIcon,
@@ -503,6 +501,20 @@ export default function ReplicationPage() {
     </div>
   );
 
+  const workloadNotice = (
+    <Notice tone="warning" className="mb-5">
+      <NoticeIcon>
+        <AlertTriangle />
+      </NoticeIcon>
+      <NoticeBody>
+        <NoticeTitle>Non-critical workloads only</NoticeTitle>
+        <NoticeDescription>
+          Use this tool for non-critical workloads up to 1 TB.
+        </NoticeDescription>
+      </NoticeBody>
+    </Notice>
+  );
+
   if (!sourceReady || !targetReady) {
     return (
       <div className={neon.page}>
@@ -513,6 +525,7 @@ export default function ReplicationPage() {
             actions={apiKeyAction}
           />
           {pickerRow}
+          {workloadNotice}
           <Notice tone="warning">
             <NoticeIcon>
               <AlertTriangle />
@@ -531,17 +544,6 @@ export default function ReplicationPage() {
                 can also set NEON_SOURCE_CONNECTION_STRING and
                 NEON_TARGET_CONNECTION_STRING in .env.local.
               </NoticeDescription>
-              <NoticeActions>
-                <Button
-                  size="lg"
-                  variant="outline"
-                  nativeButton={false}
-                  render={<Link href="/assess" />}
-                >
-                  Run an assessment first
-                  <ArrowRight className="h-3.5 w-3.5" />
-                </Button>
-              </NoticeActions>
             </NoticeBody>
           </Notice>
           <NeonSettingsModal
@@ -564,6 +566,7 @@ export default function ReplicationPage() {
         />
 
         {pickerRow}
+        {workloadNotice}
 
         {/* Brief overview, collapsible. Lands users oriented without
             forcing them to read a wall of text before they can act. */}
@@ -1113,13 +1116,31 @@ function PreflightDetails({ p }: { p: ReplicationPreflight }) {
           v={`${p.source.rolname} · ${p.source.roleHasReplication ? "yes" : "no"}`}
           tone={p.source.roleHasReplication ? "ok" : "bad"}
         />
-        <KV k="Public tables" v={String(p.source.tableCount)} />
+        <KV k="User tables" v={String(p.source.tableCount)} />
         {p.source.tablesWithoutPK.length > 0 && (
           <KV
             k="Tables w/o PK"
             v={`${p.source.tablesWithoutPK.length} (updates/deletes won't replicate)`}
             tone="warn"
           />
+        )}
+        {p.source.tables?.length > 0 && (
+          <details className="mt-3 border-t border-[#262727] pt-3">
+            <summary className="cursor-pointer text-label text-[#9ca3af] hover:text-foreground">
+              View identified tables
+            </summary>
+            <div className="mt-2 max-h-36 space-y-1 overflow-y-auto">
+              {p.source.tables.map((table) => (
+                <p
+                  className="truncate font-mono text-label text-foreground"
+                  key={table}
+                  title={table}
+                >
+                  {table}
+                </p>
+              ))}
+            </div>
+          </details>
         )}
       </div>
       <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-4">
