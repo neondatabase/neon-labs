@@ -6,6 +6,7 @@ import { useSetupStatus } from "@/lib/setup-status";
 import { clearPersistedNeonSecrets } from "@/lib/neon-settings";
 import { SetupLanding } from "./SetupLanding";
 import { AppFooter } from "./AppFooter";
+import { LabsBanner } from "./LabsBanner";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { Button } from "./ui/button";
@@ -22,7 +23,12 @@ export function SetupGate({ children }: { children: React.ReactNode }) {
   if (status.initializing) return null;
 
   if (!status.error && !status.ready && !status.skipped) {
-    return <SetupLanding status={status} />;
+    return (
+      <div className="flex min-w-0 flex-1 flex-col">
+        <LabsBanner />
+        <SetupLanding status={status} />
+      </div>
+    );
   }
 
   return (
@@ -30,6 +36,7 @@ export function SetupGate({ children }: { children: React.ReactNode }) {
       <Sidebar />
       <SidebarInset className="bg-background">
         <TopBar />
+        <LabsBanner />
         {status.error && (
           <ConfigErrorBanner
             loading={status.loading}

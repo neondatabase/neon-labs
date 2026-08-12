@@ -57,8 +57,8 @@ export default function ImportAssistantPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          targetProjectId: override?.projectId,
-          projectId: override?.projectId,
+          targetProjectId: override?.projectId ?? cfg?.targetProjectId,
+          projectId: override?.projectId ?? cfg?.targetProjectId,
         }),
       });
       const body = await res.json();
@@ -69,7 +69,7 @@ export default function ImportAssistantPage() {
     } finally {
       setPolling(false);
     }
-  }, [override]);
+  }, [override, cfg?.targetProjectId]);
 
   useEffect(() => {
     if (!autopoll) return;

@@ -17,7 +17,7 @@ export function AppFooter() {
       </a>
       <span className="text-border">·</span>
       <span className="text-micro text-muted-foreground">
-        A Databricks company
+        Neon is part of the Databricks Platform
       </span>
     </footer>
   );

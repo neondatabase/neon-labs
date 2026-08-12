@@ -1,11 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Link from "next/link";
 import {
   AlertOctagon,
   AlertTriangle,
-  ArrowRight,
   CheckCircle2,
   Loader2,
   RefreshCw,
@@ -17,7 +15,6 @@ import { TargetProjectPicker } from "@/components/TargetProjectPicker";
 import { PageHeader, neon, CopyToggleIcon } from "@/components/ui";
 import {
   Notice,
-  NoticeActions,
   NoticeBody,
   NoticeDescription,
   NoticeIcon,
@@ -198,17 +195,6 @@ export default function DumpRestorePage() {
                 You can also set NEON_SOURCE_CONNECTION_STRING and
                 NEON_TARGET_CONNECTION_STRING in .env.local.
               </NoticeDescription>
-              <NoticeActions>
-                <Button
-                  size="lg"
-                  variant="outline"
-                  nativeButton={false}
-                  render={<Link href="/assess" />}
-                >
-                  Run an assessment first
-                  <ArrowRight className="h-3.5 w-3.5" />
-                </Button>
-              </NoticeActions>
             </NoticeBody>
           </Notice>
         </div>

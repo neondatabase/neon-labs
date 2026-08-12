@@ -124,6 +124,7 @@ export interface ReplicationPreflight {
     walLevel: string;
     logicalReplicationEnabled: boolean;
     tableCount: number;
+    tables: string[];
     tablesWithoutPK: string[];
     roleHasReplication: boolean;
     rolname: string;

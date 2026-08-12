@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import Link from "next/link";
 import {
   AlertOctagon,
   AlertTriangle,
@@ -27,7 +26,6 @@ import { ClassifiedErrorBanner } from "@/components/ClassifiedErrorBanner";
 import { PageHeader, neon } from "@/components/ui";
 import {
   Notice,
-  NoticeActions,
   NoticeBody,
   NoticeDescription,
   NoticeIcon,
@@ -538,17 +536,6 @@ export default function ReplicationPage() {
                 fetches their direct connection strings from the Neon API for
                 your signed-in account.
               </NoticeDescription>
-              <NoticeActions>
-                <Button
-                  size="lg"
-                  variant="outline"
-                  nativeButton={false}
-                  render={<Link href="/assess" />}
-                >
-                  Run an assessment first
-                  <ArrowRight className="h-3.5 w-3.5" />
-                </Button>
-              </NoticeActions>
             </NoticeBody>
           </Notice>
         </div>
@@ -1111,13 +1098,31 @@ function PreflightDetails({ p }: { p: ReplicationPreflight }) {
           v={`${p.source.rolname} · ${p.source.roleHasReplication ? "yes" : "no"}`}
           tone={p.source.roleHasReplication ? "ok" : "bad"}
         />
-        <KV k="Public tables" v={String(p.source.tableCount)} />
+        <KV k="User tables" v={String(p.source.tableCount)} />
         {p.source.tablesWithoutPK.length > 0 && (
           <KV
             k="Tables w/o PK"
             v={`${p.source.tablesWithoutPK.length} (updates/deletes won't replicate)`}
             tone="warn"
           />
+        )}
+        {p.source.tables?.length > 0 && (
+          <details className="mt-3 border-t border-[#262727] pt-3">
+            <summary className="cursor-pointer text-label text-[#9ca3af] hover:text-foreground">
+              View identified tables
+            </summary>
+            <div className="mt-2 max-h-36 space-y-1 overflow-y-auto">
+              {p.source.tables.map((table) => (
+                <p
+                  className="truncate font-mono text-label text-foreground"
+                  key={table}
+                  title={table}
+                >
+                  {table}
+                </p>
+              ))}
+            </div>
+          </details>
         )}
       </div>
       <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-4">

@@ -161,6 +161,7 @@ export default function NewAssessmentPage() {
           // client-side guess as a hint, but server reads pg_settings directly.
           sourceVersion: effectiveSourceVersion,
           targetVersion,
+          sourceProjectId: sourceOverride?.projectId ?? sourceProject?.id,
           projectId: sourceOverride?.projectId ?? sourceProject?.id,
           projectName:
             sourceOverride?.projectName ?? cfg?.orgName ?? undefined,

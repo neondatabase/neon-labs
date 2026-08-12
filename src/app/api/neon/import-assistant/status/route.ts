@@ -26,6 +26,7 @@ export async function POST(request: NextRequest) {
   const { target } = await resolveConnections(body);
   const projectId =
     body.projectId ||
+    body.targetProjectId ||
     (process.env.NODE_ENV !== "production"
       ? process.env.NEON_TARGET_PROJECT_ID
       : undefined);
