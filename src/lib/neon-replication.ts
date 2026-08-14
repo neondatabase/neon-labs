@@ -4,17 +4,23 @@
 
 import { Client } from "pg";
 import type {
+  LogicalReplicationCopyProgress,
   PublisherMonitorRow,
   ReplicationMonitor,
   ReplicationPreflight,
+  ReplicationResourceInspection,
   ReplicationSetupResult,
   ReplicationStatus,
+  ReplicationTeardownResult,
+  ReplicationTeardownStep,
   SubscriberMonitorRow,
   TableReplicationState,
 } from "./types";
 
-const DEFAULT_PUB = "neon_advisor_pub";
-const DEFAULT_SUB = "neon_advisor_sub";
+export const ADVISOR_PUBLICATION = "neon_advisor_pub" as const;
+export const ADVISOR_SUBSCRIPTION = "neon_advisor_sub" as const;
+const DEFAULT_PUB = ADVISOR_PUBLICATION;
+const DEFAULT_SUB = ADVISOR_SUBSCRIPTION;
 
 interface ReplicationTableRef {
   schema: string;
@@ -673,8 +679,10 @@ export async function status(
       latest_end_lsn: string | null;
       last_msg_receipt_time: string | null;
       received_lsn: string | null;
+      subslotname: string | null;
     }>(
-      `SELECT s.subname, s.subenabled, sr.latest_end_lsn::text, sr.last_msg_receipt_time, sr.received_lsn::text
+      `SELECT s.subname, s.subenabled, s.subslotname::text,
+              sr.latest_end_lsn::text, sr.last_msg_receipt_time, sr.received_lsn::text
        FROM pg_subscription s
        LEFT JOIN pg_stat_subscription sr ON sr.subname = s.subname
        WHERE s.subname = $1`,
@@ -688,7 +696,10 @@ export async function status(
         receivedLsn: null,
         latestEndLsn: null,
         lagBytes: null,
-        initialCopyProgress: null,
+        readyTables: 0,
+        totalTables: 0,
+        initialReplicationComplete: false,
+        activeCopies: [],
         state: "stopped",
         perTable: [],
       };
@@ -702,25 +713,16 @@ export async function status(
       [subName],
     );
 
-    const stateMap: Record<string, string> = {
-      i: "initializing",
-      d: "copying",
-      s: "synchronized",
-      r: "streaming",
-    };
     const tables = perTable.rows.map((r) => ({
       table: r.srrelid,
-      state: stateMap[r.srsubstate] ?? r.srsubstate,
+      state: mapState(r.srsubstate),
     }));
 
-    const copyingCount = tables.filter(
-      (t) => t.state === "initializing" || t.state === "copying",
-    ).length;
-    const totalCount = tables.length || 1;
-    const initialCopyProgress =
-      copyingCount === 0
-        ? null
-        : Math.round(((totalCount - copyingCount) / totalCount) * 100);
+    const readyTables = tables.filter((t) => t.state === "Ready").length;
+    const totalTables = tables.length;
+    const initialReplicationComplete =
+      totalTables > 0 && readyTables === totalTables;
+    const activeCopies = await queryActiveLogicalReplicationCopies(tgt);
 
     // Real lag: ask the publisher how far ahead it is of the slot's
     // confirmed_flush_lsn. This is the byte volume the subscriber hasn't
@@ -733,7 +735,7 @@ export async function status(
         const r = await src.query<{ lag: string | null }>(
           `SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::text AS lag
            FROM pg_replication_slots WHERE slot_name = $1`,
-          [subName],
+          [sub.rows[0].subslotname],
         );
         if (r.rows.length > 0 && r.rows[0].lag !== null) {
           lagBytes = parseInt(r.rows[0].lag, 10);
@@ -764,10 +766,10 @@ export async function status(
     }
 
     const state: ReplicationStatus["state"] =
-      copyingCount > 0
-        ? "copying"
-        : sub.rows[0].subenabled
+      initialReplicationComplete && sub.rows[0].subenabled
           ? "streaming"
+          : sub.rows[0].subenabled
+            ? "copying"
           : "stopped";
 
     return {
@@ -777,7 +779,10 @@ export async function status(
       receivedLsn: sub.rows[0].received_lsn,
       latestEndLsn: sub.rows[0].latest_end_lsn,
       lagBytes,
-      initialCopyProgress,
+      readyTables,
+      totalTables,
+      initialReplicationComplete,
+      activeCopies,
       state,
       perTable: tables,
     };
@@ -808,6 +813,13 @@ JOIN pg_subscription AS sub ON sub_rel.srsubid = sub.oid;`,
        (pg_current_wal_lsn() - confirmed_flush_lsn) AS lsn_distance,
        pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lsn_distance_size
 FROM pg_replication_slots;`,
+  activeCopies: `SELECT relid::regclass::text AS table_name,
+       bytes_processed,
+       tuples_processed
+FROM pg_stat_progress_copy
+WHERE type = 'CALLBACK'
+  AND command = 'COPY FROM'
+ORDER BY table_name;`,
 };
 
 function mapState(s: string): TableReplicationState {
@@ -827,6 +839,29 @@ function mapState(s: string): TableReplicationState {
   }
 }
 
+async function queryActiveLogicalReplicationCopies(
+  target: Client,
+): Promise<LogicalReplicationCopyProgress[]> {
+  const result = await target.query<{
+    table_name: string;
+    bytes_processed: string;
+    tuples_processed: string;
+  }>(
+    `SELECT relid::regclass::text AS table_name,
+            COALESCE(bytes_processed, 0)::text AS bytes_processed,
+            COALESCE(tuples_processed, 0)::text AS tuples_processed
+     FROM pg_stat_progress_copy
+     WHERE type = 'CALLBACK'
+       AND command = 'COPY FROM'
+     ORDER BY table_name`,
+  );
+  return result.rows.map((row) => ({
+    tableName: row.table_name,
+    bytesProcessed: Number(row.bytes_processed),
+    tuplesProcessed: Number(row.tuples_processed),
+  }));
+}
+
 export async function monitor(
   sourceConn: string,
   targetConn: string,
@@ -841,14 +876,18 @@ export async function monitor(
       tablename: string;
       state: string;
       lsn: string | null;
+      slotname: string | null;
     }>(
       `SELECT s.oid::text AS oid, s.subname,
+              s.subslotname::text AS slotname,
               sr.srrelid::regclass::text AS tablename,
               sr.srsubstate AS state,
               sr.srsublsn::text AS lsn
        FROM pg_subscription_rel sr
        JOIN pg_subscription s ON s.oid = sr.srsubid
+       WHERE s.subname = $1
        ORDER BY s.subname, tablename`,
+      [ADVISOR_SUBSCRIPTION],
     );
     const subscriber: SubscriberMonitorRow[] = sub.rows.map((r) => ({
       subscriptionId: parseInt(r.oid, 10),
@@ -871,7 +910,9 @@ export async function monitor(
               (pg_current_wal_lsn() - confirmed_flush_lsn)::text AS lsn_distance,
               pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lsn_distance_size
        FROM pg_replication_slots
+       WHERE slot_name = $1
        ORDER BY slot_name`,
+      [sub.rows[0]?.slotname ?? ADVISOR_SUBSCRIPTION],
     );
     const publisher: PublisherMonitorRow[] = pub.rows.map((r) => ({
       slotName: r.slot_name,
@@ -883,10 +924,12 @@ export async function monitor(
 
     const initialReplicationComplete =
       subscriber.length > 0 && subscriber.every((r) => r.tableStatus === "Ready");
+    const activeCopies = await queryActiveLogicalReplicationCopies(tgt);
 
     return {
       subscriber,
       publisher,
+      activeCopies,
       initialReplicationComplete,
       sql: MONITOR_SQL,
     };
@@ -897,52 +940,443 @@ export async function monitor(
 
 /* ── Teardown ──────────────────────────────────────────────── */
 
+export async function inspectReplicationResources(
+  sourceConn: string,
+  targetConn: string,
+  slotNameHint?: string | null,
+): Promise<ReplicationResourceInspection> {
+  const src = new Client({ connectionString: unpool(sourceConn) });
+  const tgt = new Client({ connectionString: unpool(targetConn) });
+  await Promise.all([src.connect(), tgt.connect()]);
+  try {
+    const subscription = await tgt.query<{
+      subenabled: boolean;
+      subslotname: string | null;
+      subpublications: string[];
+    }>(
+      `SELECT subenabled, subslotname::text, subpublications::text[]
+       FROM pg_subscription
+       WHERE subname = $1`,
+      [ADVISOR_SUBSCRIPTION],
+    );
+    const sub = subscription.rows[0];
+    // When the subscription is already gone, the only slot this application
+    // creates by default is the fixed subscription name. A hint preserves an
+    // actual non-default slot recorded earlier in the same teardown attempt.
+    const slotName =
+      sub?.subslotname ?? slotNameHint ?? ADVISOR_SUBSCRIPTION;
+    const [publication, slot] = await Promise.all([
+      src.query("SELECT 1 FROM pg_publication WHERE pubname = $1", [
+        ADVISOR_PUBLICATION,
+      ]),
+      src.query<{ active: boolean; active_pid: number | null }>(
+        `SELECT active, active_pid
+         FROM pg_replication_slots
+         WHERE slot_name = $1
+           AND slot_type = 'logical'`,
+        [slotName],
+      ),
+    ]);
+    const slotRow = slot.rows[0];
+    const result: ReplicationResourceInspection = {
+      subscription: {
+        name: ADVISOR_SUBSCRIPTION,
+        state: sub ? "present" : "absent",
+        enabled: sub?.subenabled ?? null,
+        slotName: sub?.subslotname ?? null,
+        publications: sub?.subpublications ?? [],
+      },
+      publication: {
+        name: ADVISOR_PUBLICATION,
+        state: publication.rows.length > 0 ? "present" : "absent",
+      },
+      slot: {
+        name: slotRow ? slotName : sub?.subslotname ?? slotNameHint ?? null,
+        state: slotRow ? (slotRow.active ? "active" : "present") : "absent",
+        active: slotRow?.active ?? false,
+        activePid: slotRow?.active_pid ?? null,
+      },
+      anyResourceExists: Boolean(
+        sub || publication.rows.length > 0 || slotRow,
+      ),
+    };
+    return result;
+  } finally {
+    await Promise.all([
+      src.end().catch(() => undefined),
+      tgt.end().catch(() => undefined),
+    ]);
+  }
+}
+
+function failedStep(
+  id: ReplicationTeardownStep["id"],
+  label: string,
+  resource: string,
+  detail: string,
+): ReplicationTeardownStep {
+  return { id, label, resource, status: "failed", detail };
+}
+
 export async function teardown(
   sourceConn: string,
   targetConn: string,
-  opts: { publicationName?: string; subscriptionName?: string } = {},
-): Promise<{ droppedSubscription: boolean; droppedPublication: boolean }> {
-  const pubName = opts.publicationName ?? DEFAULT_PUB;
-  const subName = opts.subscriptionName ?? DEFAULT_SUB;
-
-  let droppedSub = false;
+): Promise<ReplicationTeardownResult> {
+  const before = await inspectReplicationResources(sourceConn, targetConn);
+  const recordedSlotName = before.subscription.slotName ?? before.slot.name;
+  const steps: ReplicationTeardownStep[] = [];
   const tgt = new Client({ connectionString: unpool(targetConn) });
-  await tgt.connect();
-  try {
-    const exists = await tgt.query(
-      "SELECT 1 FROM pg_subscription WHERE subname = $1",
-      [subName],
-    );
-    if (exists.rows.length > 0) {
-      // Disable & detach the slot first so it doesn't linger on the publisher
-      await tgt.query(`ALTER SUBSCRIPTION "${subName}" DISABLE`);
-      await tgt.query(`ALTER SUBSCRIPTION "${subName}" SET (slot_name = NONE)`);
-      await tgt.query(`DROP SUBSCRIPTION "${subName}"`);
-      droppedSub = true;
-    }
-  } finally {
-    await tgt.end();
-  }
-
-  let droppedPub = false;
   const src = new Client({ connectionString: unpool(sourceConn) });
-  await src.connect();
+  await Promise.all([tgt.connect(), src.connect()]);
+
+  let targetClean = before.subscription.state === "absent";
+  let slotClean = before.slot.state === "absent";
   try {
-    const exists = await src.query(
-      "SELECT 1 FROM pg_publication WHERE pubname = $1",
-      [pubName],
-    );
-    if (exists.rows.length > 0) {
-      await src.query(`DROP PUBLICATION "${pubName}"`);
-      droppedPub = true;
+    if (before.subscription.state === "absent") {
+      steps.push({
+        id: "disable-subscription",
+        label: "Disable target subscription",
+        resource: ADVISOR_SUBSCRIPTION,
+        status: "already absent",
+        detail: "The target subscription is already absent.",
+      });
+    } else {
+      try {
+        await tgt.query(
+          `ALTER SUBSCRIPTION "${ADVISOR_SUBSCRIPTION}" DISABLE`,
+        );
+        steps.push({
+          id: "disable-subscription",
+          label: "Disable target subscription",
+          resource: ADVISOR_SUBSCRIPTION,
+          status: "removed",
+          detail: "The subscription was disabled.",
+        });
+      } catch (error) {
+        steps.push(
+          failedStep(
+            "disable-subscription",
+            "Disable target subscription",
+            ADVISOR_SUBSCRIPTION,
+            error instanceof Error ? error.message : String(error),
+          ),
+        );
+      }
     }
-    // Also drop any orphan replication slot
-    await src
-      .query("SELECT pg_drop_replication_slot($1)", [subName])
-      .catch(() => undefined);
+
+    const disableFailed = steps.at(-1)?.status === "failed";
+    const manualSlotCleanupRequired =
+      !disableFailed &&
+      before.subscription.state === "present" &&
+      Boolean(recordedSlotName);
+
+    if (before.subscription.state === "absent") {
+      steps.push({
+        id: "detach-slot",
+        label: "Detach replication slot",
+        resource: recordedSlotName ?? "replication slot",
+        status: "already absent",
+        detail: "No subscription exists, so there is no slot attachment.",
+      });
+    } else if (disableFailed) {
+      steps.push(
+        failedStep(
+          "detach-slot",
+          "Detach replication slot",
+          recordedSlotName ?? "replication slot",
+          "Not attempted because the subscription could not be disabled.",
+        ),
+      );
+    } else if (!manualSlotCleanupRequired) {
+      steps.push({
+        id: "detach-slot",
+        label: "Detach replication slot",
+        resource: recordedSlotName ?? "replication slot",
+        status: "already absent",
+        detail: "Manual slot cleanup is not required.",
+      });
+    } else {
+      try {
+        await tgt.query(
+          `ALTER SUBSCRIPTION "${ADVISOR_SUBSCRIPTION}" SET (slot_name = NONE)`,
+        );
+        steps.push({
+          id: "detach-slot",
+          label: "Detach replication slot",
+          resource: recordedSlotName!,
+          status: "removed",
+          detail:
+            "The recorded slot was detached so it can be verified and removed manually.",
+        });
+      } catch (error) {
+        steps.push(
+          failedStep(
+            "detach-slot",
+            "Detach replication slot",
+            recordedSlotName!,
+            error instanceof Error ? error.message : String(error),
+          ),
+        );
+      }
+    }
+
+    const detachFailed =
+      steps.find((step) => step.id === "detach-slot")?.status === "failed";
+    if (before.subscription.state === "absent") {
+      steps.push({
+        id: "drop-subscription",
+        label: "Drop target subscription",
+        resource: ADVISOR_SUBSCRIPTION,
+        status: "already absent",
+        detail: "The target subscription is already absent.",
+      });
+    } else if (disableFailed || detachFailed) {
+      steps.push(
+        failedStep(
+          "drop-subscription",
+          "Drop target subscription",
+          ADVISOR_SUBSCRIPTION,
+          "Not attempted because the subscription could not be safely disabled and detached.",
+        ),
+      );
+    } else {
+      try {
+        await tgt.query(`DROP SUBSCRIPTION "${ADVISOR_SUBSCRIPTION}"`);
+        targetClean = true;
+        steps.push({
+          id: "drop-subscription",
+          label: "Drop target subscription",
+          resource: ADVISOR_SUBSCRIPTION,
+          status: "removed",
+          detail: "The target subscription was removed.",
+        });
+      } catch (error) {
+        steps.push(
+          failedStep(
+            "drop-subscription",
+            "Drop target subscription",
+            ADVISOR_SUBSCRIPTION,
+            error instanceof Error ? error.message : String(error),
+          ),
+        );
+      }
+    }
+
+    if (!targetClean) {
+      steps.push(
+        failedStep(
+          "confirm-slot-inactive",
+          "Confirm source slot is inactive",
+          recordedSlotName ?? "replication slot",
+          "Not attempted because the target subscription remains.",
+        ),
+      );
+      steps.push(
+        failedStep(
+          "drop-slot",
+          "Drop source replication slot",
+          recordedSlotName ?? "replication slot",
+          "Not attempted because the target subscription remains.",
+        ),
+      );
+    } else if (!recordedSlotName || before.slot.state === "absent") {
+      slotClean = true;
+      steps.push({
+        id: "confirm-slot-inactive",
+        label: "Confirm source slot is inactive",
+        resource: recordedSlotName ?? "replication slot",
+        status: "already absent",
+        detail: "The source replication slot is already absent.",
+      });
+      steps.push({
+        id: "drop-slot",
+        label: "Drop source replication slot",
+        resource: recordedSlotName ?? "replication slot",
+        status: "already absent",
+        detail: "The source replication slot is already absent.",
+      });
+    } else {
+      let slot = await src.query<{
+        active: boolean;
+        active_pid: number | null;
+      }>(
+        "SELECT active, active_pid FROM pg_replication_slots WHERE slot_name = $1",
+        [recordedSlotName],
+      );
+      // Disabling the subscription is asynchronous. Give PostgreSQL a brief
+      // chance to release the walsender, but never terminate it ourselves.
+      for (
+        let attempt = 0;
+        slot.rows[0]?.active && attempt < 5;
+        attempt++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        slot = await src.query<{
+          active: boolean;
+          active_pid: number | null;
+        }>(
+          "SELECT active, active_pid FROM pg_replication_slots WHERE slot_name = $1",
+          [recordedSlotName],
+        );
+      }
+      if (slot.rows.length === 0) {
+        slotClean = true;
+        steps.push({
+          id: "confirm-slot-inactive",
+          label: "Confirm source slot is inactive",
+          resource: recordedSlotName,
+          status: "already absent",
+          detail: "The source replication slot is already absent.",
+        });
+        steps.push({
+          id: "drop-slot",
+          label: "Drop source replication slot",
+          resource: recordedSlotName,
+          status: "already absent",
+          detail: "The source replication slot is already absent.",
+        });
+      } else if (slot.rows[0].active) {
+        steps.push(
+          failedStep(
+            "confirm-slot-inactive",
+            "Confirm source slot is inactive",
+            recordedSlotName,
+            `The slot is still active${slot.rows[0].active_pid ? ` on PID ${slot.rows[0].active_pid}` : ""}; it was not force-dropped.`,
+          ),
+        );
+        steps.push(
+          failedStep(
+            "drop-slot",
+            "Drop source replication slot",
+            recordedSlotName,
+            "Not attempted because PostgreSQL reports the slot as active.",
+          ),
+        );
+      } else {
+        steps.push({
+          id: "confirm-slot-inactive",
+          label: "Confirm source slot is inactive",
+          resource: recordedSlotName,
+          status: "removed",
+          detail: "PostgreSQL reports the source slot as inactive.",
+        });
+        try {
+          await src.query("SELECT pg_drop_replication_slot($1)", [
+            recordedSlotName,
+          ]);
+          slotClean = true;
+          steps.push({
+            id: "drop-slot",
+            label: "Drop source replication slot",
+            resource: recordedSlotName,
+            status: "removed",
+            detail: "The inactive source replication slot was removed.",
+          });
+        } catch (error) {
+          steps.push(
+            failedStep(
+              "drop-slot",
+              "Drop source replication slot",
+              recordedSlotName,
+              error instanceof Error ? error.message : String(error),
+            ),
+          );
+        }
+      }
+    }
+
+    if (before.publication.state === "absent") {
+      steps.push({
+        id: "drop-publication",
+        label: "Drop source publication",
+        resource: ADVISOR_PUBLICATION,
+        status: "already absent",
+        detail: "The source publication is already absent.",
+      });
+    } else if (!targetClean || !slotClean) {
+      steps.push(
+        failedStep(
+          "drop-publication",
+          "Drop source publication",
+          ADVISOR_PUBLICATION,
+          "Not attempted until the subscription and replication slot are removed.",
+        ),
+      );
+    } else {
+      try {
+        await src.query(`DROP PUBLICATION "${ADVISOR_PUBLICATION}"`);
+        steps.push({
+          id: "drop-publication",
+          label: "Drop source publication",
+          resource: ADVISOR_PUBLICATION,
+          status: "removed",
+          detail: "The source publication was removed last.",
+        });
+      } catch (error) {
+        steps.push(
+          failedStep(
+            "drop-publication",
+            "Drop source publication",
+            ADVISOR_PUBLICATION,
+            error instanceof Error ? error.message : String(error),
+          ),
+        );
+      }
+    }
   } finally {
-    await src.end();
+    await Promise.all([
+      src.end().catch(() => undefined),
+      tgt.end().catch(() => undefined),
+    ]);
   }
 
-  return { droppedSubscription: droppedSub, droppedPublication: droppedPub };
+  const after = await inspectReplicationResources(
+    sourceConn,
+    targetConn,
+    recordedSlotName,
+  );
+  const remainingResources = [
+    after.subscription.state !== "absent"
+      ? `subscription ${ADVISOR_SUBSCRIPTION}`
+      : null,
+    after.slot.state !== "absent" && after.slot.name
+      ? `replication slot ${after.slot.name}`
+      : null,
+    after.publication.state !== "absent"
+      ? `publication ${ADVISOR_PUBLICATION}`
+      : null,
+  ].filter((resource): resource is string => resource !== null);
+  const ok = remainingResources.length === 0;
+  steps.push({
+    id: "verify-removal",
+    label: "Verify resource removal",
+    resource: "all application-owned replication resources",
+    status: ok ? "removed" : "failed",
+    detail: ok
+      ? "Subscription, replication slot, and publication are absent."
+      : `Still present: ${remainingResources.join(", ")}.`,
+  });
+
+  const recoveryInstructions = ok
+    ? []
+    : [
+        "Keep the source project available and retry teardown after resolving the failed step.",
+        ...(after.subscription.state !== "absent"
+          ? [`Disable and remove ${ADVISOR_SUBSCRIPTION} on the target first.`]
+          : []),
+        ...(after.slot.state === "active"
+          ? [
+              `Wait for replication slot ${after.slot.name} to become inactive; this tool will never force-drop an active slot.`,
+            ]
+          : after.slot.state === "present"
+            ? [`Retry removal of inactive replication slot ${after.slot.name}.`]
+            : []),
+        ...(after.publication.state !== "absent"
+          ? [
+              `Remove ${ADVISOR_PUBLICATION} only after the subscription and slot are absent.`,
+            ]
+          : []),
+      ];
+
+  return { ok, before, after, steps, remainingResources, recoveryInstructions };
 }

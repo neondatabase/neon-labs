@@ -160,10 +160,13 @@ export interface ReplicationStatus {
   receivedLsn: string | null;
   latestEndLsn: string | null;
   lagBytes: number | null;
-  /** % progress of initial copy 0-100, null if not copying or already streaming */
-  initialCopyProgress: number | null;
+  readyTables: number;
+  totalTables: number;
+  /** True only when every subscribed table reports Ready. */
+  initialReplicationComplete: boolean;
+  activeCopies: LogicalReplicationCopyProgress[];
   state: "copying" | "streaming" | "stopped" | "unknown";
-  perTable: { table: string; state: string }[];
+  perTable: { table: string; state: TableReplicationState }[];
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -195,16 +198,76 @@ export interface PublisherMonitorRow {
   lsnDistanceSize: string;
 }
 
+export interface LogicalReplicationCopyProgress {
+  tableName: string;
+  bytesProcessed: number;
+  tuplesProcessed: number;
+}
+
 export interface ReplicationMonitor {
   subscriber: SubscriberMonitorRow[];
   publisher: PublisherMonitorRow[];
+  activeCopies: LogicalReplicationCopyProgress[];
   /** True when every subscribed table reports "Ready" */
   initialReplicationComplete: boolean;
   /** SQL the panel ran, exposed so users can paste it into the Neon SQL editor */
   sql: {
     subscriber: string;
     publisher: string;
+    activeCopies: string;
   };
+}
+
+export type ReplicationResourceState = "present" | "absent" | "active";
+
+export interface ReplicationResourceInspection {
+  subscription: {
+    name: "neon_advisor_sub";
+    state: "present" | "absent";
+    enabled: boolean | null;
+    slotName: string | null;
+    publications: string[];
+  };
+  publication: {
+    name: "neon_advisor_pub";
+    state: "present" | "absent";
+  };
+  slot: {
+    name: string | null;
+    state: ReplicationResourceState;
+    active: boolean;
+    activePid: number | null;
+  };
+  anyResourceExists: boolean;
+}
+
+export type ReplicationTeardownStepStatus =
+  | "removed"
+  | "already absent"
+  | "failed";
+
+export interface ReplicationTeardownStep {
+  id:
+    | "disable-subscription"
+    | "detach-slot"
+    | "drop-subscription"
+    | "confirm-slot-inactive"
+    | "drop-slot"
+    | "drop-publication"
+    | "verify-removal";
+  label: string;
+  resource: string;
+  status: ReplicationTeardownStepStatus;
+  detail: string;
+}
+
+export interface ReplicationTeardownResult {
+  ok: boolean;
+  before: ReplicationResourceInspection;
+  after: ReplicationResourceInspection;
+  steps: ReplicationTeardownStep[];
+  remainingResources: string[];
+  recoveryInstructions: string[];
 }
 
 /* ──────────────────────────────────────────────────────────────

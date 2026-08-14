@@ -47,8 +47,10 @@ import type {
   CutoverResult,
   ReplicationMonitor,
   ReplicationPreflight,
+  ReplicationResourceInspection,
   ReplicationSetupResult,
   ReplicationStatus,
+  ReplicationTeardownResult,
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 
@@ -104,9 +106,16 @@ export default function ReplicationPage() {
   const [selectedTables, setSelectedTables] = useState<string[]>([]);
   const [tableSelectionReady, setTableSelectionReady] = useState(false);
   const [resumedSession, setResumedSession] = useState(false);
+  const [teardownInspection, setTeardownInspection] =
+    useState<ReplicationResourceInspection | null>(null);
+  const [teardownResult, setTeardownResult] =
+    useState<ReplicationTeardownResult | null>(null);
+  const [confirmTeardown, setConfirmTeardown] = useState(false);
   const recoveryChecks = useRef(new Set<string>());
 
   useEffect(() => {
+    // Hydrate tab-scoped project choices after the client mounts.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setTargetOverrideState(getTargetOverride());
     setSourceOverrideState(getSourceOverride());
   }, []);
@@ -147,12 +156,50 @@ export default function ReplicationPage() {
     return raw;
   }
 
+  const inspectTeardown = useCallback(async () => {
+    try {
+      const response = await fetch("/api/neon/replication/teardown", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...targetBody(), action: "inspect" }),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        throw new Error(body?.error ?? "Replication resource inspection failed");
+      }
+      setTeardownInspection(body as ReplicationResourceInspection);
+    } catch (inspectionError) {
+      setError(
+        inspectionError instanceof Error
+          ? inspectionError.message
+          : "Replication resource inspection failed",
+      );
+    }
+  }, [targetBody]);
+
   useEffect(() => {
     fetch("/api/neon/config")
       .then((r) => (r.ok ? r.json() : null))
       .then(setCfg)
       .catch(() => setCfg(null));
   }, []);
+
+  useEffect(() => {
+    if (
+      !(sourceProjectId || cfg?.hasSourceConnection) ||
+      !(targetProjectId || cfg?.hasTargetConnection)
+    ) {
+      return;
+    }
+    const timeout = window.setTimeout(() => void inspectTeardown(), 0);
+    return () => window.clearTimeout(timeout);
+  }, [
+    cfg?.hasSourceConnection,
+    cfg?.hasTargetConnection,
+    inspectTeardown,
+    sourceProjectId,
+    targetProjectId,
+  ]);
 
   useEffect(() => {
     if (
@@ -228,9 +275,12 @@ export default function ReplicationPage() {
 
   useEffect(() => {
     if (phase !== "monitoring") return;
-    pollStatus();
+    const initial = window.setTimeout(() => void pollStatus(), 0);
     const i = setInterval(pollStatus, 3000);
-    return () => clearInterval(i);
+    return () => {
+      window.clearTimeout(initial);
+      clearInterval(i);
+    };
   }, [phase, pollStatus]);
 
   async function runPreflight() {
@@ -300,36 +350,47 @@ export default function ReplicationPage() {
       setClassifiedError(null);
       setSetup(body);
       setPhase("monitoring");
+      await inspectTeardown();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Setup failed");
       setPhase("preflight-done");
+      await inspectTeardown();
     }
   }
 
   async function runTeardown() {
-    if (!confirm("Drop the subscription on the target and the publication on the source?"))
-      return;
+    if (!confirmTeardown) return;
     setPhase("tearing-down");
     setError(null);
     try {
       const res = await fetch("/api/neon/replication/teardown", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(targetBody()),
+        body: JSON.stringify({
+          ...targetBody(),
+          action: "execute",
+          confirm: true,
+        }),
       });
       const body = await res.json();
       if (!res.ok) throw new Error(handleApiError(body, `Failed (${res.status})`));
       setClassifiedError(null);
-      setSetup(null);
-      setStatus(null);
-      setResumedSession(false);
-      setCutoverPre(null);
-      setCutoverResult(null);
-      setPhase("idle");
-      setPreflight(null);
+      const result = body as ReplicationTeardownResult;
+      setTeardownResult(result);
+      setTeardownInspection(result.after);
+      setConfirmTeardown(false);
+      if (result.ok) {
+        setSetup(null);
+        setStatus(null);
+        setResumedSession(false);
+        setCutoverPre(null);
+        setPhase(cutoverResult ? "cutover-complete" : "idle");
+      } else {
+        setPhase(setup ? "monitoring" : cutoverResult ? "cutover-complete" : "idle");
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Teardown failed");
-      setPhase("monitoring");
+      setPhase(setup ? "monitoring" : cutoverResult ? "cutover-complete" : "idle");
     }
   }
 
@@ -449,9 +510,12 @@ export default function ReplicationPage() {
 
   useEffect(() => {
     if (!monitorAutopoll) return;
-    fetchMonitor();
+    const initial = window.setTimeout(() => void fetchMonitor(), 0);
     const id = setInterval(fetchMonitor, 5000);
-    return () => clearInterval(id);
+    return () => {
+      window.clearTimeout(initial);
+      clearInterval(id);
+    };
   }, [monitorAutopoll, fetchMonitor]);
 
   async function copySql(key: string, value: string) {
@@ -473,21 +537,11 @@ export default function ReplicationPage() {
     switch (id) {
       case "drop-orphan-slot":
       case "drop-orphan-subscription": {
-        try {
-          const res = await fetch("/api/neon/replication/force-cleanup", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              ...targetBody(),
-              ...(payload ?? {}),
-            }),
-          });
-          const body = await res.json();
-          if (!res.ok)
-            throw new Error(handleApiError(body, `Failed (${res.status})`));
-        } catch (e) {
-          setError(e instanceof Error ? e.message : "Cleanup failed");
-        }
+        void payload;
+        await inspectTeardown();
+        setError(
+          "Review the replication teardown panel and explicitly confirm the exact resources before cleanup.",
+        );
         return;
       }
       case "rerun-setup":
@@ -555,6 +609,9 @@ export default function ReplicationPage() {
             setSelectedTables([]);
             setTableSelectionReady(false);
             setResumedSession(false);
+            setTeardownInspection(null);
+            setTeardownResult(null);
+            setConfirmTeardown(false);
             setPhase("idle");
           }}
         />
@@ -571,11 +628,14 @@ export default function ReplicationPage() {
             setCutoverPre(null);
             setCutoverResult(null);
             setResumedSession(false);
+            setTeardownInspection(null);
+            setTeardownResult(null);
+            setConfirmTeardown(false);
             setPhase("idle");
           }}
         />
       </div>
-      <span className="font-mono text-label text-[#9ca3af]">phase: {phase}</span>
+      <span className="text-label text-[#9ca3af]">Phase: {phase}</span>
     </div>
   );
 
@@ -696,33 +756,30 @@ export default function ReplicationPage() {
                 <span className="font-mono">pg_subscription_rel</span> on
                 target every 3s to show per-table state (copying, ready) and
                 replication lag.{" "}
-                <span className="text-foreground">04b Monitoring</span> runs Neon's
+                <span className="text-foreground">Advanced monitoring</span> runs Neon&apos;s
                 recommended publisher + subscriber health queries on demand.
               </div>
             </li>
             <li className="flex gap-2">
               <span className="font-mono tnum text-[#00e599]">05</span>
               <div>
-                <span className="text-foreground">Cutover</span> preflight checks
-                row counts, sequence drift, slot activity, then on execute
-                runs: drain lag, reset target sequences via Neon's DO block
-                (so the first nextval() after cutover doesn't collide),
-                verify, disable subscription. Whole thing takes a few seconds
-                under steady state.
+                <span className="text-foreground">Analyze target</span> rebuilds
+                optimizer statistics after the initial copy, before traffic
+                reaches the target.
               </div>
             </li>
             <li className="flex gap-2">
               <span className="font-mono tnum text-[#00e599]">06</span>
               <div>
-                <span className="text-foreground">Cutover complete</span> surfaces
-                the new primary connection string for you to swap into your
-                app's <span className="font-mono">DATABASE_URL</span>, with a
-                deep-link to the target project in the Neon Console.
+                <span className="text-foreground">Cutover</span> checks row
+                counts, sequence drift, and slot activity, then drains lag,
+                resets target sequences, verifies the target, and disables the
+                subscription.
               </div>
             </li>
           </ol>
           <p className="mt-3 text-label text-[#9ca3af]">
-            Each step also lives in Neon's docs:{" "}
+            Each step also lives in Neon&apos;s docs:{" "}
             <a
               href="https://neon.com/docs/guides/logical-replication-neon-to-neon"
               target="_blank"
@@ -913,7 +970,15 @@ export default function ReplicationPage() {
                   <RefreshCw className="h-3.5 w-3.5" />
                   Refresh
                 </Button>
-                <Button size="lg" variant="destructive" onClick={runTeardown}>
+                <Button
+                  size="lg"
+                  variant="destructive"
+                  onClick={() =>
+                    document
+                      .getElementById("replication-teardown")
+                      ?.scrollIntoView({ behavior: "auto", block: "start" })
+                  }
+                >
                   <Trash2 className="h-3.5 w-3.5" />
                   Teardown
                 </Button>
@@ -923,9 +988,16 @@ export default function ReplicationPage() {
             {resumedSession ? (
               <div className="mb-3 rounded-[4px] border border-[#00e599]/30 bg-[#00e599]/[0.06] px-3 py-2 text-caption text-[#00e599]">
                 Existing replication detected. Monitoring resumed after the
-                page refresh; the database copy continued in Postgres.
+                page refresh; the database copy continued in Postgres. Do not
+                run setup again.
               </div>
             ) : null}
+            <div className="mb-3 rounded-[4px] border border-[#f59e0b]/40 bg-[#f59e0b]/[0.08] px-3 py-2 text-caption text-[#f59e0b]">
+              Replication continues in Postgres after you leave or refresh this
+              page. Refresh only reloads monitoring; it never restarts
+              replication. Wait until every table is Ready and replication lag
+              is near zero before cutover.
+            </div>
             {status ? <StatusDetails s={status} /> : (
               <p className={`text-caption ${neon.muted}`}>Awaiting first status poll…</p>
             )}
@@ -935,7 +1007,7 @@ export default function ReplicationPage() {
         {/* Logical replication monitoring (Neon recommended health queries) */}
         {setup && (
           <Section
-            step="04b"
+            eyebrow="Advanced monitoring"
             title="Logical replication monitoring"
             subtitle="Subscriber per-table state + publisher LSN distance, straight from Neon's recommended monitoring queries"
             action={
@@ -971,102 +1043,10 @@ export default function ReplicationPage() {
           </Section>
         )}
 
-        {/* Step 5: Cutover */}
-        {setup && status?.state === "streaming" && !cutoverResult && (
-          <Section
-            step="05"
-            title="Cutover"
-            subtitle="Drain lag, reset sequences, disable subscription, swap connection strings"
-            danger
-            action={
-              !cutoverPre ? (
-                <Button size="lg" variant="white"
-                  onClick={runCutoverPreflight}
-                  disabled={phase === "cutover-preflight"}
-                >
-                  {phase === "cutover-preflight" ? (
-                    <>
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      Checking…
-                    </>
-                  ) : (
-                    <>
-                      <RefreshCw className="h-3.5 w-3.5" />
-                      Cutover preflight
-                    </>
-                  )}
-                </Button>
-              ) : (
-                <div className="flex gap-2">
-                  <Button size="lg" variant="ghost" onClick={runCutoverPreflight}>
-                    <RefreshCw className="h-3.5 w-3.5" />
-                    Re-check
-                  </Button>
-                  <Button size="lg"
-                    onClick={executeCutover}
-                    disabled={!cutoverPre.ok || phase === "cutting-over"}
-                    variant={confirmCutover ? "destructive" : "white"}
-                  >
-                    {phase === "cutting-over" ? (
-                      <>
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        Cutting over…
-                      </>
-                    ) : confirmCutover ? (
-                      <>
-                        <AlertOctagon className="h-3.5 w-3.5" />
-                        Confirm cutover
-                      </>
-                    ) : (
-                      <>
-                        <Repeat className="h-3.5 w-3.5" />
-                        Execute cutover
-                      </>
-                    )}
-                  </Button>
-                </div>
-              )
-            }
-          >
-            {cutoverPre && <CutoverPreflightDetails p={cutoverPre} />}
-          </Section>
-        )}
-
-        {/* Step 6: Cutover complete */}
-        {cutoverResult && (
-          <Section
-            step="06"
-            title="Cutover complete"
-            subtitle={`Took ${(cutoverResult.totalDurationMs / 1000).toFixed(2)}s · ${cutoverResult.sequencesReset.length} sequence(s) reset · final lag ${cutoverResult.finalLagBytes ?? "?"} bytes`}
-            action={
-              <Button size="lg" variant="ghost" onClick={runRollback}>
-                <Undo2 className="h-3.5 w-3.5" />
-                Rollback
-              </Button>
-            }
-          >
-            <CutoverResultDetails
-              r={cutoverResult}
-              onCopyConn={() => copyConnectionString(cutoverResult.newPrimaryConnectionString)}
-              copiedConn={copiedConn}
-              sourceProjectId={sourceProjectId}
-              sourceProjectName={sourceOverride?.projectName ?? sourceProjectId}
-              sourcePgVersion={
-                preflight?.source.pgVersion ?? sourceOverride?.pgVersion ?? null
-              }
-              targetProjectId={targetProjectId}
-              targetProjectName={targetOverride?.projectName ?? targetProjectId}
-              targetPgVersion={
-                preflight?.target.pgVersion ?? targetOverride?.pgVersion ?? null
-              }
-            />
-          </Section>
-        )}
-
-        {/* Step 7: Rebuild optimizer statistics on the target */}
+        {/* Step 5: Rebuild optimizer statistics on the target */}
         {setup && (status?.state === "streaming" || cutoverResult) && (
           <Section
-            step="07"
+            step="05"
             title="Analyze target"
             subtitle="Rebuild optimizer statistics before traffic reaches the target"
             action={
@@ -1157,6 +1137,126 @@ export default function ReplicationPage() {
           </Section>
         )}
 
+        {/* Step 6: Cutover */}
+        {setup && status?.state === "streaming" && !cutoverResult && (
+          <Section
+            step="06"
+            title="Cutover"
+            subtitle="Drain lag, reset sequences, disable subscription, swap connection strings"
+            danger
+            action={
+              !cutoverPre ? (
+                <Button size="lg" variant="white"
+                  onClick={runCutoverPreflight}
+                  disabled={phase === "cutover-preflight"}
+                >
+                  {phase === "cutover-preflight" ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Checking…
+                    </>
+                  ) : (
+                    <>
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      Cutover preflight
+                    </>
+                  )}
+                </Button>
+              ) : (
+                <div className="flex gap-2">
+                  <Button size="lg" variant="ghost" onClick={runCutoverPreflight}>
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    Re-check
+                  </Button>
+                  <Button size="lg"
+                    onClick={executeCutover}
+                    disabled={!cutoverPre.ok || phase === "cutting-over"}
+                    variant={confirmCutover ? "destructive" : "white"}
+                  >
+                    {phase === "cutting-over" ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        Cutting over…
+                      </>
+                    ) : confirmCutover ? (
+                      <>
+                        <AlertOctagon className="h-3.5 w-3.5" />
+                        Confirm cutover
+                      </>
+                    ) : (
+                      <>
+                        <Repeat className="h-3.5 w-3.5" />
+                        Execute cutover
+                      </>
+                    )}
+                  </Button>
+                </div>
+              )
+            }
+          >
+            {cutoverPre && <CutoverPreflightDetails p={cutoverPre} />}
+          </Section>
+        )}
+
+        {/* Cutover result */}
+        {cutoverResult && (
+          <Section
+            eyebrow="Status"
+            title="Cutover complete"
+            subtitle={`Took ${(cutoverResult.totalDurationMs / 1000).toFixed(2)}s · ${cutoverResult.sequencesReset.length} sequence(s) reset · final lag ${cutoverResult.finalLagBytes ?? "?"} bytes`}
+            action={
+              <Button size="lg" variant="ghost" onClick={runRollback}>
+                <Undo2 className="h-3.5 w-3.5" />
+                Rollback
+              </Button>
+            }
+          >
+            <CutoverResultDetails
+              r={cutoverResult}
+              onCopyConn={() => copyConnectionString(cutoverResult.newPrimaryConnectionString)}
+              copiedConn={copiedConn}
+              sourceProjectId={sourceProjectId}
+              sourceProjectName={sourceOverride?.projectName ?? sourceProjectId}
+              sourcePgVersion={
+                preflight?.source.pgVersion ?? sourceOverride?.pgVersion ?? null
+              }
+              targetProjectId={targetProjectId}
+              targetProjectName={targetOverride?.projectName ?? targetProjectId}
+              targetPgVersion={
+                preflight?.target.pgVersion ?? targetOverride?.pgVersion ?? null
+              }
+            />
+          </Section>
+        )}
+
+        {(teardownInspection?.anyResourceExists || teardownResult) && (
+          <div id="replication-teardown">
+            <Section
+              eyebrow="Cleanup"
+              title="Replication teardown"
+              subtitle="Inspect and remove only the replication resources created by this application"
+              danger
+              action={
+                <Button size="lg" variant="ghost" onClick={inspectTeardown}>
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Refresh resources
+                </Button>
+              }
+            >
+              {teardownInspection ? (
+                <TeardownPanel
+                  inspection={teardownInspection}
+                  result={teardownResult}
+                  confirmed={confirmTeardown}
+                  busy={phase === "tearing-down"}
+                  onConfirmedChange={setConfirmTeardown}
+                  onTeardown={runTeardown}
+                />
+              ) : null}
+            </Section>
+          </div>
+        )}
+
         {classifiedError ? (
           <ClassifiedErrorBanner
             classified={classifiedError}
@@ -1177,13 +1277,15 @@ export default function ReplicationPage() {
 
 function Section({
   step,
+  eyebrow,
   title,
   subtitle,
   action,
   children,
   danger,
 }: {
-  step: string;
+  step?: string;
+  eyebrow?: string;
   title: string;
   subtitle?: string;
   action?: React.ReactNode;
@@ -1200,7 +1302,11 @@ function Section({
     >
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
-          <span className="tag text-[#00e599]">Step {step}</span>
+          {(step || eyebrow) && (
+            <span className="text-micro uppercase tracking-[0.08em] text-[#00e599]">
+              {step ? `Step ${step}` : eyebrow}
+            </span>
+          )}
           <h2 className={`${neon.h2} mt-1`}>{title}</h2>
           {subtitle && (
             <p className={`mt-1 text-caption tabular-nums text-pretty ${neon.muted}`}>
@@ -1374,14 +1480,7 @@ function PreflightDetails({ p }: { p: ReplicationPreflight }) {
 }
 
 function StatusDetails({ s }: { s: ReplicationStatus }) {
-  const lagText =
-    s.lagBytes === null
-      ? "—"
-      : s.lagBytes < 1024
-        ? `${s.lagBytes} B`
-        : s.lagBytes < 1024 * 1024
-          ? `${(s.lagBytes / 1024).toFixed(1)} KB`
-          : `${(s.lagBytes / 1024 / 1024).toFixed(2)} MB`;
+  const lagText = s.lagBytes === null ? "—" : formatBytes(s.lagBytes);
 
   return (
     <>
@@ -1403,27 +1502,94 @@ function StatusDetails({ s }: { s: ReplicationStatus }) {
         <Stat
           icon={Database}
           label="Initial copy"
-          value={
-            s.initialCopyProgress === null ? "done" : `${s.initialCopyProgress}%`
-          }
-          tone={s.initialCopyProgress === null ? "ok" : "warn"}
+          value={`${s.readyTables} of ${s.totalTables} Ready`}
+          tone={s.initialReplicationComplete ? "ok" : "warn"}
         />
       </div>
 
+      <div
+        className={`mb-4 rounded-[4px] border p-3 ${
+          s.initialReplicationComplete
+            ? "border-[#00e599]/40 bg-[#00e599]/[0.06]"
+            : "border-[#f59e0b]/40 bg-[#f59e0b]/[0.06]"
+        }`}
+      >
+        {s.initialReplicationComplete ? (
+          <p className="flex items-center gap-2 text-caption text-[#00e599]">
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            Initial replication complete — every subscribed table is Ready.
+          </p>
+        ) : (
+          <div className="space-y-3">
+            <div>
+              <p className="text-caption font-medium text-foreground">
+                {s.readyTables} of {s.totalTables} tables Ready.
+              </p>
+              <div
+                aria-label="Initial replication in progress"
+                aria-valuetext={`${s.readyTables} of ${s.totalTables} tables Ready`}
+                className="mt-2 h-1.5 overflow-hidden rounded-[2px] bg-[#262727]"
+                role="progressbar"
+              >
+                <div className="replication-indeterminate-bar h-full w-1/3 rounded-[2px] bg-[#00e599]" />
+              </div>
+            </div>
+            {s.activeCopies.length > 0 ? (
+              <div className="space-y-2">
+                {s.activeCopies.map((copy) => (
+                  <div
+                    className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] px-3 py-2"
+                    key={copy.tableName}
+                  >
+                    <p className="text-caption text-foreground">
+                      Copying{" "}
+                      <span className="font-mono">{copy.tableName}</span>
+                    </p>
+                    <p className="mt-1 text-label text-[#9ca3af]">
+                      Current table copy:{" "}
+                      <span className="font-mono text-[#f3f4f6]">
+                        {formatBytes(copy.bytesProcessed)}
+                      </span>{" "}
+                      ·{" "}
+                      <span className="font-mono text-[#f3f4f6]">
+                        {formatRows(copy.tuplesProcessed)}
+                      </span>{" "}
+                      rows processed
+                    </p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-label text-[#d6a44c]">
+                Waiting for the next table copy update.
+              </p>
+            )}
+            <p className="text-label text-[#9ca3af]">
+              These values describe each active table copy only. PostgreSQL
+              does not normally report a total byte count for logical
+              replication callbacks, so no percentage or migration-total
+              estimate is shown.
+            </p>
+          </div>
+        )}
+      </div>
+
       <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
-        <p className="tag mb-2">Per-table state</p>
+        <p className="mb-2 text-micro uppercase tracking-[0.08em] text-[#9ca3af]">
+          Per-table state
+        </p>
         <div className="grid gap-1 text-label">
           {s.perTable.length === 0 ? (
             <p className={neon.muted}>No tables in subscription yet.</p>
           ) : (
             s.perTable.map((t) => (
-              <div key={t.table} className="flex items-center justify-between font-mono">
-                <span className="text-foreground">{t.table}</span>
+              <div key={t.table} className="flex items-center justify-between gap-3">
+                <span className="font-mono text-foreground">{t.table}</span>
                 <span
                   className={
-                    t.state === "streaming"
+                    t.state === "Ready"
                       ? "text-[#00e599]"
-                      : t.state === "synchronized"
+                      : t.state === "Synchronized"
                         ? "text-[#00e599]"
                         : "text-[#f59e0b]"
                   }
@@ -1443,6 +1609,25 @@ function StatusDetails({ s }: { s: ReplicationStatus }) {
       )}
     </>
   );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = -1;
+  do {
+    value /= 1024;
+    unit++;
+  } while (value >= 1024 && unit < units.length - 1);
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+function formatRows(rows: number): string {
+  return new Intl.NumberFormat("en-US", {
+    notation: rows >= 1_000_000 ? "compact" : "standard",
+    maximumFractionDigits: 1,
+  }).format(rows);
 }
 
 function MonitorDetails({
@@ -1499,7 +1684,9 @@ function MonitorDetails({
       {/* Subscriber */}
       <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
         <div className="mb-2 flex items-center justify-between">
-          <p className="tag">Subscriber — per-table state</p>
+          <p className="text-micro uppercase tracking-[0.08em] text-[#9ca3af]">
+            Subscriber — per-table state
+          </p>
           <button
             type="button"
             onClick={() => onCopySql("subscriber", m.sql.subscriber)}
@@ -1567,8 +1754,8 @@ function MonitorDetails({
         <p className="mt-2 text-label text-[#9ca3af]">
           <span className="text-[#00e599]">Ready</span> means initial copy
           finished and the table is now being kept up to date by the apply
-          worker. <span className="font-mono">Init copy ended at</span> is a
-          historical marker (<span className="font-mono">srsublsn</span>) — for
+          worker. Init copy ended at is a historical marker (
+          <span className="font-mono">srsublsn</span>) — for
           live replication position, see the publisher panel below.
         </p>
       </div>
@@ -1576,7 +1763,9 @@ function MonitorDetails({
       {/* Publisher */}
       <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
         <div className="mb-2 flex items-center justify-between">
-          <p className="tag">Publisher — LSN distance per slot</p>
+          <p className="text-micro uppercase tracking-[0.08em] text-[#9ca3af]">
+            Publisher — LSN distance per slot
+          </p>
           <button
             type="button"
             onClick={() => onCopySql("publisher", m.sql.publisher)}
@@ -1669,6 +1858,207 @@ function MonitorDetails({
           </div>
         </div>
       </details>
+    </div>
+  );
+}
+
+function TeardownPanel({
+  inspection,
+  result,
+  confirmed,
+  busy,
+  onConfirmedChange,
+  onTeardown,
+}: {
+  inspection: ReplicationResourceInspection;
+  result: ReplicationTeardownResult | null;
+  confirmed: boolean;
+  busy: boolean;
+  onConfirmedChange: (confirmed: boolean) => void;
+  onTeardown: () => void;
+}) {
+  const stateColor = (state: string) =>
+    state === "absent"
+      ? "text-[#9ca3af]"
+      : state === "active"
+        ? "text-[#ef4444]"
+        : "text-[#f59e0b]";
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-[4px] border border-[#ef4444]/40 bg-[#ef4444]/[0.08] p-3">
+        <p className="flex items-center gap-2 text-caption font-medium text-[#ef4444]">
+          <AlertOctagon className="h-3.5 w-3.5" />
+          Teardown permanently stops replication and removes the
+          replication-based rollback path.
+        </p>
+        <p className="mt-2 text-label leading-[1.55] text-[#f3f4f6]">
+          Keep the source project, subscription, publication, and replication
+          slot for 24–48 hours after cutover when possible. Teardown only after
+          the target is stable and you no longer need source rollback.
+        </p>
+      </div>
+
+      <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
+        <p className="mb-3 text-micro uppercase tracking-[0.08em] text-[#9ca3af]">
+          Exact resources
+        </p>
+        <dl className="space-y-2 text-caption">
+          <div className="flex items-start justify-between gap-4">
+            <dt className="text-[#9ca3af]">Target subscription</dt>
+            <dd className="text-right">
+              <span className="font-mono text-foreground">
+                {inspection.subscription.name}
+              </span>
+              <span
+                className={`ml-2 ${stateColor(inspection.subscription.state)}`}
+              >
+                {inspection.subscription.state}
+                {inspection.subscription.state === "present"
+                  ? inspection.subscription.enabled
+                    ? " · enabled"
+                    : " · disabled"
+                  : ""}
+              </span>
+            </dd>
+          </div>
+          <div className="flex items-start justify-between gap-4">
+            <dt className="text-[#9ca3af]">Source publication</dt>
+            <dd className="text-right">
+              <span className="font-mono text-foreground">
+                {inspection.publication.name}
+              </span>
+              <span
+                className={`ml-2 ${stateColor(inspection.publication.state)}`}
+              >
+                {inspection.publication.state}
+              </span>
+            </dd>
+          </div>
+          <div className="flex items-start justify-between gap-4">
+            <dt className="text-[#9ca3af]">Source replication slot</dt>
+            <dd className="text-right">
+              <span className="font-mono text-foreground">
+                {inspection.slot.name ?? "—"}
+              </span>
+              <span className={`ml-2 ${stateColor(inspection.slot.state)}`}>
+                {inspection.slot.state}
+              </span>
+            </dd>
+          </div>
+          {inspection.subscription.publications.length > 0 ? (
+            <div className="flex items-start justify-between gap-4 border-t border-[#262727] pt-2">
+              <dt className="text-[#9ca3af]">Recorded publication list</dt>
+              <dd className="text-right font-mono text-foreground">
+                {inspection.subscription.publications.join(", ")}
+              </dd>
+            </div>
+          ) : null}
+        </dl>
+      </div>
+
+      {inspection.slot.state === "active" ? (
+        <div className="rounded-[4px] border border-[#f59e0b]/40 bg-[#f59e0b]/[0.08] px-3 py-2 text-caption text-[#f59e0b]">
+          The replication slot is active. This tool will not terminate its
+          process or force-drop it. Disable and remove the subscription, then
+          retry after PostgreSQL reports the slot inactive.
+        </div>
+      ) : null}
+
+      {inspection.anyResourceExists ? (
+        <div className="space-y-3">
+          <label className="flex cursor-pointer items-start gap-2 rounded-[4px] border border-[#262727] bg-[#0c0d0d] px-3 py-2 text-caption text-foreground">
+            <input
+              checked={confirmed}
+              className="mt-0.5 size-3.5 accent-[#ef4444]"
+              onChange={(event) => onConfirmedChange(event.target.checked)}
+              type="checkbox"
+            />
+            <span>
+              I understand that teardown permanently stops replication and
+              removes the replication-based rollback path.
+            </span>
+          </label>
+          <Button
+            disabled={!confirmed || busy}
+            onClick={onTeardown}
+            size="lg"
+            variant="destructive"
+          >
+            {busy ? (
+              <>
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Tearing down…
+              </>
+            ) : (
+              <>
+                <Trash2 className="h-3.5 w-3.5" />
+                Permanently stop replication
+              </>
+            )}
+          </Button>
+        </div>
+      ) : null}
+
+      {result ? (
+        <div className="space-y-3">
+          <div
+            className={`rounded-[4px] border px-3 py-2 text-caption ${
+              result.ok
+                ? "border-[#00e599]/40 bg-[#00e599]/[0.08] text-[#00e599]"
+                : "border-[#ef4444]/40 bg-[#ef4444]/[0.08] text-[#ef4444]"
+            }`}
+          >
+            {result.ok
+              ? "Teardown verified. No application-owned replication resources remain."
+              : `Teardown is incomplete. Remaining resources: ${result.remainingResources.join(", ")}.`}
+          </div>
+          <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
+            <p className="mb-2 text-micro uppercase tracking-[0.08em] text-[#9ca3af]">
+              Teardown steps
+            </p>
+            <div className="space-y-2">
+              {result.steps.map((step) => (
+                <div
+                  className="flex items-start justify-between gap-4 border-b border-[#262727]/60 pb-2 text-label last:border-0 last:pb-0"
+                  key={step.id}
+                >
+                  <div>
+                    <p className="text-foreground">{step.label}</p>
+                    <p className="mt-0.5 text-[#9ca3af]">{step.detail}</p>
+                    <p className="mt-0.5 font-mono text-[#9ca3af]">
+                      {step.resource}
+                    </p>
+                  </div>
+                  <span
+                    className={
+                      step.status === "failed"
+                        ? "text-[#ef4444]"
+                        : step.status === "removed"
+                          ? "text-[#00e599]"
+                          : "text-[#9ca3af]"
+                    }
+                  >
+                    {step.status}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+          {result.recoveryInstructions.length > 0 ? (
+            <div className="rounded-[4px] border border-[#f59e0b]/40 bg-[#f59e0b]/[0.08] p-3">
+              <p className="text-caption font-medium text-[#f59e0b]">
+                Recovery for remaining resources
+              </p>
+              <ul className="mt-2 list-disc space-y-1 pl-4 text-label text-[#f3f4f6]">
+                {result.recoveryInstructions.map((instruction) => (
+                  <li key={instruction}>{instruction}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1927,7 +2317,7 @@ function CutoverResultDetails({
         </p>
         {targetProjectId && (
           <p className="mt-1 text-label text-[#9ca3af]">
-            The Console's Connect button will show this project's connection
+            The Console&apos;s Connect button will show this project&apos;s connection
             strings for every role and database, plus a one-click Connect
             modal you can copy into your app.
           </p>
@@ -2060,7 +2450,9 @@ function Stat({
     <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
       <div className="flex items-center gap-1.5">
         <Icon className="h-3 w-3" style={{ color }} />
-        <span className="tag">{label}</span>
+        <span className="text-micro uppercase tracking-[0.08em] text-[#9ca3af]">
+          {label}
+        </span>
       </div>
       <p
         className="mt-1.5 text-heading font-medium tracking-[-0.3px] tnum"
