@@ -17,7 +17,15 @@ import {
 } from "react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
+import { Label } from "./ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./ui/select";
 import {
   getSourceOverride,
   getTargetOverride,
@@ -25,6 +33,10 @@ import {
   setTargetOverride,
   type TargetOverride,
 } from "@/lib/neon-settings";
+import {
+  NEON_SUPPORTED_VERSIONS,
+  type PgMajorVersion,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 interface ProjectRow {
@@ -74,6 +86,20 @@ function matchesQuery(
   return terms.every((term) => haystack.includes(term));
 }
 
+function matchesOrganizationQuery(
+  organization: OrganizationGroup,
+  query: string,
+) {
+  const terms = query.trim().toLowerCase().split(/\s+/u).filter(Boolean);
+  if (terms.length === 0) return true;
+  const organizationName = organization.name.toLowerCase();
+  return terms.every((term) => organizationName.includes(term));
+}
+
+function defaultTargetName(pgVersion: PgMajorVersion) {
+  return `upgrade-target-pg${pgVersion}-${new Date().toISOString().slice(0, 10)}`;
+}
+
 /** Searchable source/target selector grouped by every Neon organization the
     current credential can access. The composition follows Neon UI's
     ModelSelect and BranchPicker patterns using registry primitives only. */
@@ -85,7 +111,7 @@ export function TargetProjectPicker({
 }: {
   onChange?: (target: TargetOverride | null) => void;
   className?: string;
-  targetPgVersion?: number;
+  targetPgVersion?: PgMajorVersion;
   role?: "source" | "target";
 }) {
   const isSource = role === "source";
@@ -106,6 +132,8 @@ export function TargetProjectPicker({
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const [createOrg, setCreateOrg] = useState<OrganizationGroup | null>(null);
   const [newProjectName, setNewProjectName] = useState("");
+  const [newTargetPgVersion, setNewTargetPgVersion] =
+    useState<PgMajorVersion>(targetPgVersion);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const authenticated = Boolean(cfg?.authenticated);
@@ -171,7 +199,11 @@ export function TargetProjectPicker({
             matchesQuery(project, organization, query),
           ),
         }))
-        .filter((organization) => organization.projects.length > 0),
+        .filter(
+          (organization) =>
+            organization.projects.length > 0 ||
+            matchesOrganizationQuery(organization, query),
+        ),
     [organizations, query],
   );
   const visibleProjects = visibleOrganizations.flatMap(
@@ -238,9 +270,8 @@ export function TargetProjectPicker({
 
   function beginCreate(organization: OrganizationGroup) {
     setCreateOrg(organization);
-    setNewProjectName(
-      `upgrade-target-pg${targetPgVersion}-${new Date().toISOString().slice(0, 10)}`,
-    );
+    setNewTargetPgVersion(targetPgVersion);
+    setNewProjectName(defaultTargetName(targetPgVersion));
     setError(null);
   }
 
@@ -256,7 +287,7 @@ export function TargetProjectPicker({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name,
-          pgVersion: targetPgVersion,
+          pgVersion: newTargetPgVersion,
           regionId: "aws-us-west-2",
           orgId: createOrg.id,
         }),
@@ -440,20 +471,70 @@ export function TargetProjectPicker({
                         <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
                           Create in {organization.name}
                         </p>
-                        <Input
-                          aria-label="New project name"
-                          className="h-8 font-mono text-xs"
-                          onChange={(event) =>
-                            setNewProjectName(event.target.value)
-                          }
-                          onKeyDown={(event) => {
-                            if (event.key === "Escape") {
-                              setCreateOrg(null);
-                              setNewProjectName("");
-                            }
-                          }}
-                          value={newProjectName}
-                        />
+                        <div className="grid grid-cols-[minmax(0,1fr)_108px] gap-2">
+                          <div>
+                            <Label
+                              className="mb-1 text-[10px] text-muted-foreground"
+                              htmlFor={`new-target-name-${organization.id}`}
+                            >
+                              Project name
+                            </Label>
+                            <Input
+                              className="h-8 font-mono text-xs"
+                              id={`new-target-name-${organization.id}`}
+                              onChange={(event) =>
+                                setNewProjectName(event.target.value)
+                              }
+                              onKeyDown={(event) => {
+                                if (event.key === "Escape") {
+                                  setCreateOrg(null);
+                                  setNewProjectName("");
+                                }
+                              }}
+                              value={newProjectName}
+                            />
+                          </div>
+                          <div>
+                            <Label
+                              className="mb-1 text-[10px] text-muted-foreground"
+                              htmlFor={`new-target-version-${organization.id}`}
+                            >
+                              Postgres
+                            </Label>
+                            <Select
+                              onValueChange={(value) => {
+                                const nextVersion = Number(
+                                  value,
+                                ) as PgMajorVersion;
+                                setNewProjectName((currentName) =>
+                                  currentName ===
+                                  defaultTargetName(newTargetPgVersion)
+                                    ? defaultTargetName(nextVersion)
+                                    : currentName,
+                                );
+                                setNewTargetPgVersion(nextVersion);
+                              }}
+                              value={String(newTargetPgVersion)}
+                            >
+                              <SelectTrigger
+                                className="h-8 w-full rounded-md font-mono text-xs"
+                                id={`new-target-version-${organization.id}`}
+                              >
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {NEON_SUPPORTED_VERSIONS.map((version) => (
+                                  <SelectItem
+                                    key={version}
+                                    value={String(version)}
+                                  >
+                                    PG {version}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        </div>
                         <div className="flex justify-end gap-2">
                           <Button
                             onClick={() => {
@@ -519,6 +600,12 @@ export function TargetProjectPicker({
                         </Button>
                       );
                     })}
+                    {organization.projects.length === 0 &&
+                    createOrg?.id !== organization.id ? (
+                      <p className="px-2 py-3 text-xs text-muted-foreground">
+                        No eligible projects in this organization.
+                      </p>
+                    ) : null}
                   </section>
                 ))}
 

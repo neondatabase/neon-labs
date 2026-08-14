@@ -70,6 +70,21 @@ export interface NeonOrganization {
   name: string;
 }
 
+export interface NeonCurrentUser {
+  id: string;
+  name: string;
+  last_name: string;
+  image: string;
+  auth_accounts: {
+    name: string;
+    image: string;
+  }[];
+}
+
+export async function getCurrentUser(accessToken: string) {
+  return neonFetch<NeonCurrentUser>("/users/me", accessToken);
+}
+
 export async function listOrganizations(accessToken: string) {
   return neonFetch<{ organizations: NeonOrganization[] }>(
     "/users/me/organizations",

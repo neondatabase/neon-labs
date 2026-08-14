@@ -752,19 +752,36 @@ export default function ReplicationPage() {
             title="Provision publication + subscription"
             subtitle="Copies schema, creates publication on source, creates subscription on target"
             action={
-              <Button size="lg" variant="white" onClick={runSetup} disabled={!preflight.ok || phase === "setting-up"}>
-                {phase === "setting-up" ? (
-                  <>
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    Provisioning…
-                  </>
-                ) : (
-                  <>
-                    <Zap className="h-3.5 w-3.5" />
-                    Start replication
-                  </>
-                )}
-              </Button>
+              <div className="flex flex-col items-end gap-1.5">
+                <Button
+                  size="lg"
+                  variant="white"
+                  onClick={runSetup}
+                  disabled={!preflight.ok || phase === "setting-up"}
+                  title={
+                    !preflight.ok
+                      ? "Resolve the preflight blockers before starting replication."
+                      : undefined
+                  }
+                >
+                  {phase === "setting-up" ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Provisioning…
+                    </>
+                  ) : (
+                    <>
+                      <Zap className="h-3.5 w-3.5" />
+                      Start replication
+                    </>
+                  )}
+                </Button>
+                {!preflight.ok ? (
+                  <p className="text-label text-[#f59e0b]">
+                    Resolve the preflight blockers above to continue.
+                  </p>
+                ) : null}
+              </div>
             }
           >
             <ol className="space-y-2 text-caption text-[#f3f4f6]">

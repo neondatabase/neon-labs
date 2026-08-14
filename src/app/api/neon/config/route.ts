@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getOrganization } from "@/lib/neon-api";
+import { getCurrentUser, getOrganization } from "@/lib/neon-api";
 import { resolveConnections } from "@/lib/neon-credentials";
 import {
   getAuthenticationStatus,
@@ -30,6 +30,28 @@ async function resolveOrgName(orgId: string | null) {
   }
 }
 
+async function resolveCurrentUser() {
+  const accessToken = await getOAuthAccessTokenFromSession();
+  if (!accessToken) return null;
+
+  try {
+    const user = await getCurrentUser(accessToken);
+    const linkedAccount = user.auth_accounts.find(
+      (account) => account.image || account.name,
+    );
+    const name =
+      [user.name, user.last_name].filter(Boolean).join(" ").trim() ||
+      linkedAccount?.name ||
+      "Neon user";
+    return {
+      name,
+      image: user.image || linkedAccount?.image || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function GET() {
   const localDevelopment = process.env.NODE_ENV !== "production";
   const source = localDevelopment
@@ -37,7 +59,10 @@ export async function GET() {
     : undefined;
   const orgId = localDevelopment ? process.env.NEON_ORG_ID || null : null;
   const auth = await getAuthenticationStatus();
-  const resolved = await resolveConnections();
+  const [resolved, currentUser] = await Promise.all([
+    resolveConnections(),
+    auth.authenticated ? resolveCurrentUser() : Promise.resolve(null),
+  ]);
 
   return NextResponse.json({
     sourceIsPooled: Boolean(source && /-pooler\./.test(source)),
@@ -54,5 +79,6 @@ export async function GET() {
     authenticated: auth.authenticated,
     oauthConfigured: auth.oauthConfigured,
     developmentFallback: auth.developmentFallback,
+    user: currentUser,
   });
 }

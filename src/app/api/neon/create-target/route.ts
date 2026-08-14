@@ -2,6 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { createProject } from "@/lib/neon-api";
 import { MISSING_AUTH_ERROR } from "@/lib/neon-credentials";
 import { getOAuthAccessTokenFromSession } from "@/lib/neon-oauth";
+import {
+  NEON_SUPPORTED_VERSIONS,
+  type PgMajorVersion,
+} from "@/lib/types";
 
 /* POST /api/neon/create-target
    body: { name, pgVersion, regionId?, orgId? }
@@ -28,6 +32,17 @@ export async function POST(request: NextRequest) {
   }
   if (!body.name) {
     return NextResponse.json({ error: "name is required" }, { status: 400 });
+  }
+  if (
+    body.pgVersion !== undefined &&
+    !NEON_SUPPORTED_VERSIONS.includes(body.pgVersion as PgMajorVersion)
+  ) {
+    return NextResponse.json(
+      {
+        error: `pgVersion must be one of: ${NEON_SUPPORTED_VERSIONS.join(", ")}`,
+      },
+      { status: 400 },
+    );
   }
 
   const orgId =

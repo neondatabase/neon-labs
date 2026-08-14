@@ -42,6 +42,10 @@ export function TopBar() {
   /* At a section root the section crumb already names the page. */
   const title = pathname === section?.href ? null : (TITLES[pathname] ?? null);
   const [orgName, setOrgName] = useState<string | null>(null);
+  const [user, setUser] = useState<{
+    name: string;
+    image: string | null;
+  } | null>(null);
   const [authenticated, setAuthenticated] = useState(false);
   const [developmentFallback, setDevelopmentFallback] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
@@ -55,15 +59,28 @@ export function TopBar() {
             orgName?: string | null;
             authenticated?: boolean;
             developmentFallback?: boolean;
+            user?: {
+              name?: string | null;
+              image?: string | null;
+            } | null;
           } | null,
         ) => {
           setOrgName(cfg?.orgName || null);
+          setUser(
+            cfg?.user?.name
+              ? {
+                  name: cfg.user.name,
+                  image: cfg.user.image || null,
+                }
+              : null,
+          );
           setAuthenticated(Boolean(cfg?.authenticated));
           setDevelopmentFallback(Boolean(cfg?.developmentFallback));
         },
       )
       .catch(() => {
         setOrgName(null);
+        setUser(null);
         setAuthenticated(false);
       });
   }, []);
@@ -121,10 +138,23 @@ export function TopBar() {
         )}
         {(authenticated || developmentFallback) && (
           <div
-            title={orgName ?? "Connected to Neon"}
-            className="ml-1 flex h-7 w-7 items-center justify-center rounded-full bg-[#00e599]/15 text-label font-medium text-[#00e599]"
+            title={user?.name ?? orgName ?? "Connected to Neon"}
+            className="relative ml-1 flex h-7 w-7 items-center justify-center overflow-hidden rounded-full bg-[#00e599]/15 text-label font-medium text-[#00e599]"
           >
-            {initials(orgName ?? "Neon")}
+            {initials(user?.name ?? orgName ?? "Neon")}
+            {user?.image ? (
+              // The avatar host is supplied by the user's Neon identity provider.
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                alt={`${user.name} avatar`}
+                className="absolute inset-0 h-full w-full object-cover"
+                onError={(event) => {
+                  event.currentTarget.style.display = "none";
+                }}
+                referrerPolicy="no-referrer"
+                src={user.image}
+              />
+            ) : null}
           </div>
         )}
       </div>

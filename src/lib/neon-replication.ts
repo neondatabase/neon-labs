@@ -136,9 +136,23 @@ export async function preflight(
           SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary
         )
     `);
-    const repRole = await src.query<{ rolreplication: boolean; rolname: string }>(
-      "SELECT rolname, rolreplication FROM pg_roles WHERE rolname = current_user",
-    );
+    const repRole = await src.query<{
+      rolreplication: boolean;
+      rolname: string;
+      neon_superuser_member: boolean;
+    }>(`
+      SELECT
+        role.rolname,
+        role.rolreplication,
+        EXISTS (
+          SELECT 1
+          FROM pg_roles neon_role
+          WHERE neon_role.rolname = 'neon_superuser'
+            AND pg_has_role(current_user, neon_role.oid, 'member')
+        ) AS neon_superuser_member
+      FROM pg_roles role
+      WHERE role.rolname = current_user
+    `);
 
     const tgtTables = await tgt.query<{ schema: string; table: string }>(`
       SELECT n.nspname AS schema, c.relname AS table
@@ -169,6 +183,10 @@ export async function preflight(
       : noPK.rows;
     const walLevel = srcVersion.wal;
     const logicalEnabled = walLevel === "logical";
+    const roleHasReplication = Boolean(
+      repRole.rows[0]?.rolreplication ||
+        repRole.rows[0]?.neon_superuser_member,
+    );
     const tableCount = sourceTables.length;
     const tables = sourceTables.map(tableName);
     const tablesWithoutPK = sourceTablesWithoutPK.map(tableName);
@@ -188,7 +206,7 @@ export async function preflight(
         `Source wal_level is '${walLevel}'. Enable logical replication on the source Neon project (irreversible).`,
       );
     }
-    if (!repRole.rows[0]?.rolreplication) {
+    if (!roleHasReplication) {
       blockers.push(
         `Connection role '${srcVersion.user}' does not have REPLICATION privilege.`,
       );
@@ -220,7 +238,7 @@ export async function preflight(
         tableCount,
         tables,
         tablesWithoutPK,
-        roleHasReplication: !!repRole.rows[0]?.rolreplication,
+        roleHasReplication,
         rolname: srcVersion.user,
       },
       target: {
