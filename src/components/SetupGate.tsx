@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
-import { Plug } from "lucide-react";
+import { ArrowLeft, Plug } from "lucide-react";
 import { useSetupStatus } from "@/lib/setup-status";
 import { clearPersistedNeonSecrets } from "@/lib/neon-settings";
 import { SetupLanding } from "./SetupLanding";
@@ -106,7 +106,8 @@ function UnconnectedBanner({ onConnect }: { onConnect: () => void }) {
         onClick={onConnect}
         className="font-medium text-[#f59e0b] underline underline-offset-2 hover:bg-[#f59e0b]/10 hover:text-[#f59e0b]"
       >
-        Connect
+        <ArrowLeft />
+        Return to sign in
       </Button>
     </Notice>
   );

@@ -16,10 +16,68 @@ import type {
 const DEFAULT_PUB = "neon_advisor_pub";
 const DEFAULT_SUB = "neon_advisor_sub";
 
+interface ReplicationTableRef {
+  schema: string;
+  table: string;
+  qualifiedName: string;
+}
+
 /** Returns `host` and unpooled (`-pooler` removed) connection string. */
 function unpool(conn: string): string {
   // Logical replication requires a direct compute connection, not the pooler.
   return conn.replace(/-pooler/g, "");
+}
+
+function quoteIdent(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function tableName(table: Pick<ReplicationTableRef, "schema" | "table">): string {
+  return `${table.schema}.${table.table}`;
+}
+
+async function resolveTableSelection(
+  sourceConn: string,
+  requestedTables?: string[],
+): Promise<ReplicationTableRef[] | null> {
+  if (requestedTables === undefined) return null;
+  const requested = [...new Set(requestedTables.map((table) => table.trim()))];
+  if (requested.length === 0 || requested.some((table) => !table)) {
+    throw new Error("Select at least one source table to replicate.");
+  }
+
+  const src = new Client({ connectionString: unpool(sourceConn) });
+  await src.connect();
+  try {
+    const available = await src.query<{ schema: string; table: string }>(`
+      SELECT n.nspname AS schema, c.relname AS table
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind = 'r'
+        AND n.nspname <> 'information_schema'
+        AND n.nspname !~ '^pg_'
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.objid = c.oid AND d.deptype = 'e'
+        )
+      ORDER BY 1, 2
+    `);
+    const byName = new Map(
+      available.rows.map((table) => [
+        tableName(table),
+        { ...table, qualifiedName: tableName(table) },
+      ]),
+    );
+    const missing = requested.filter((name) => !byName.has(name));
+    if (missing.length > 0) {
+      throw new Error(
+        `Selected table${missing.length === 1 ? "" : "s"} not found on source: ${missing.join(", ")}`,
+      );
+    }
+    return requested.map((name) => byName.get(name)!);
+  } finally {
+    await src.end();
+  }
 }
 
 /* ── Preflight ─────────────────────────────────────────────── */
@@ -27,7 +85,15 @@ function unpool(conn: string): string {
 export async function preflight(
   sourceConn: string,
   targetConn: string,
+  requestedTables?: string[],
 ): Promise<ReplicationPreflight> {
+  const selectedTables = await resolveTableSelection(
+    sourceConn,
+    requestedTables,
+  );
+  const selectedTableNames = selectedTables
+    ? new Set(selectedTables.map((table) => table.qualifiedName))
+    : null;
   const src = new Client({ connectionString: unpool(sourceConn) });
   const tgt = new Client({ connectionString: unpool(targetConn) });
   await Promise.all([src.connect(), tgt.connect()]);
@@ -91,15 +157,27 @@ export async function preflight(
       [DEFAULT_SUB],
     );
 
+    const sourceTables = selectedTableNames
+      ? srcTables.rows.filter((table) =>
+          selectedTableNames.has(tableName(table)),
+        )
+      : srcTables.rows;
+    const sourceTablesWithoutPK = selectedTableNames
+      ? noPK.rows.filter((table) =>
+          selectedTableNames.has(tableName(table)),
+        )
+      : noPK.rows;
     const walLevel = srcVersion.wal;
     const logicalEnabled = walLevel === "logical";
-    const tableCount = srcTables.rows.length;
-    const tables = srcTables.rows.map((r) => `${r.schema}.${r.table}`);
-    const tablesWithoutPK = noPK.rows.map((r) => `${r.schema}.${r.table}`);
+    const tableCount = sourceTables.length;
+    const tables = sourceTables.map(tableName);
+    const tablesWithoutPK = sourceTablesWithoutPK.map(tableName);
     const targetTables = new Set(
       tgtTables.rows.map((r) => `${r.schema}.${r.table}`),
     );
-    const targetSchemaTableCount = targetTables.size;
+    const targetSchemaTableCount = selectedTableNames
+      ? tables.filter((table) => targetTables.has(table)).length
+      : targetTables.size;
     const targetSchemaLoaded =
       tableCount > 0 && tables.every((table) => targetTables.has(table));
 
@@ -116,7 +194,7 @@ export async function preflight(
       );
     }
     if (tableCount === 0) {
-      blockers.push("No tables found in public schema on source.");
+      blockers.push("No user tables found on source.");
     }
     if (!targetSchemaLoaded) {
       warnings.push(
@@ -180,6 +258,7 @@ interface SchemaCopyReport {
 async function copySchemaIfNeeded(
   sourceConn: string,
   targetConn: string,
+  selectedTables: ReplicationTableRef[] | null,
 ): Promise<SchemaCopyReport> {
   const report: SchemaCopyReport = {
     extensionsCreated: [],
@@ -195,23 +274,33 @@ async function copySchemaIfNeeded(
   const tgt = new Client({ connectionString: unpool(targetConn) });
   await Promise.all([src.connect(), tgt.connect()]);
   try {
+    const selectedTableNames = selectedTables
+      ? new Set(selectedTables.map((table) => table.qualifiedName))
+      : null;
+
     // 1. User-defined schemas. Logical replication is database-wide, not
     //    limited to `public`, so preserve every non-system schema containing
     //    a user table or sequence.
-    const schemas = await src.query<{ schema: string }>(`
-      SELECT DISTINCT n.nspname AS schema
-      FROM pg_namespace n
-      JOIN pg_class c ON c.relnamespace = n.oid
-      WHERE c.relkind IN ('r', 'S')
-        AND n.nspname <> 'information_schema'
-        AND n.nspname !~ '^pg_'
-        AND NOT EXISTS (
-          SELECT 1 FROM pg_depend d
-          WHERE d.objid = c.oid AND d.deptype = 'e'
+    const schemas = selectedTables
+      ? [...new Set(selectedTables.map((table) => table.schema))].map(
+          (schema) => ({ schema }),
         )
-      ORDER BY 1
-    `);
-    for (const { schema } of schemas.rows) {
+      : (
+          await src.query<{ schema: string }>(`
+            SELECT DISTINCT n.nspname AS schema
+            FROM pg_namespace n
+            JOIN pg_class c ON c.relnamespace = n.oid
+            WHERE c.relkind IN ('r', 'S')
+              AND n.nspname <> 'information_schema'
+              AND n.nspname !~ '^pg_'
+              AND NOT EXISTS (
+                SELECT 1 FROM pg_depend d
+                WHERE d.objid = c.oid AND d.deptype = 'e'
+              )
+            ORDER BY 1
+          `)
+        ).rows;
+    for (const { schema } of schemas) {
       try {
         await tgt.query(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
       } catch (err) {
@@ -241,10 +330,32 @@ async function copySchemaIfNeeded(
 
     // 3. Sequences first, column defaults like nextval('foo_id_seq'::regclass)
     //    will fail if the sequence doesn't exist on the target.
-    const sequences = await src.query<{ schema: string; seq: string }>(`
-      SELECT n.nspname AS schema, c.relname AS seq
+    const sequences = await src.query<{
+      schema: string;
+      seq: string;
+      owner_schema: string | null;
+      owner_table: string | null;
+    }>(`
+      SELECT DISTINCT
+        n.nspname AS schema,
+        c.relname AS seq,
+        COALESCE(owned_ns.nspname, default_ns.nspname) AS owner_schema,
+        COALESCE(owned_table.relname, default_table.relname) AS owner_table
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
+      LEFT JOIN pg_depend owned_dep
+        ON owned_dep.objid = c.oid
+       AND owned_dep.classid = 'pg_class'::regclass
+       AND owned_dep.refclassid = 'pg_class'::regclass
+       AND owned_dep.deptype IN ('a', 'i')
+      LEFT JOIN pg_class owned_table ON owned_table.oid = owned_dep.refobjid
+      LEFT JOIN pg_namespace owned_ns ON owned_ns.oid = owned_table.relnamespace
+      LEFT JOIN pg_depend default_dep
+        ON default_dep.refobjid = c.oid
+       AND default_dep.classid = 'pg_attrdef'::regclass
+      LEFT JOIN pg_attrdef attr_default ON attr_default.oid = default_dep.objid
+      LEFT JOIN pg_class default_table ON default_table.oid = attr_default.adrelid
+      LEFT JOIN pg_namespace default_ns ON default_ns.oid = default_table.relnamespace
       WHERE c.relkind = 'S'
         AND n.nspname <> 'information_schema'
         AND n.nspname !~ '^pg_'
@@ -254,7 +365,17 @@ async function copySchemaIfNeeded(
         )
       ORDER BY c.relname
     `);
-    for (const s of sequences.rows) {
+    const sequencesToCopy = selectedTableNames
+      ? sequences.rows.filter(
+          (sequence) =>
+            sequence.owner_schema &&
+            sequence.owner_table &&
+            selectedTableNames.has(
+              `${sequence.owner_schema}.${sequence.owner_table}`,
+            ),
+        )
+      : sequences.rows;
+    for (const s of sequencesToCopy) {
       try {
         await tgt.query(
           `CREATE SEQUENCE IF NOT EXISTS "${s.schema}"."${s.seq}"`,
@@ -284,7 +405,13 @@ async function copySchemaIfNeeded(
       ORDER BY c.relname
     `);
 
-    for (const t of tables.rows) {
+    const tablesToCopy = selectedTableNames
+      ? tables.rows.filter((table) =>
+          selectedTableNames.has(tableName(table)),
+        )
+      : tables.rows;
+
+    for (const t of tablesToCopy) {
       const exists = await tgt.query<{ n: string }>(
         "SELECT count(*)::text AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname = $1 AND c.relname = $2",
         [t.schema, t.table],
@@ -349,8 +476,15 @@ async function copySchemaIfNeeded(
 
     // 5. Indexes (non-PK, since PKs were inlined above).
     //    Use pg_get_indexdef() which produces fully qualified, valid DDL.
-    const indexes = await src.query<{ indexname: string; indexdef: string }>(`
-      SELECT i.indexrelid::regclass::text AS indexname,
+    const indexes = await src.query<{
+      schema: string;
+      table: string;
+      indexname: string;
+      indexdef: string;
+    }>(`
+      SELECT n.nspname AS schema,
+             c.relname AS table,
+             i.indexrelid::regclass::text AS indexname,
              pg_get_indexdef(i.indexrelid) AS indexdef
       FROM pg_index i
       JOIN pg_class c ON c.oid = i.indrelid
@@ -364,7 +498,12 @@ async function copySchemaIfNeeded(
           WHERE d.objid = i.indexrelid AND d.deptype = 'e'
         )
     `);
-    for (const ix of indexes.rows) {
+    const indexesToCopy = selectedTableNames
+      ? indexes.rows.filter((index) =>
+          selectedTableNames.has(tableName(index)),
+        )
+      : indexes.rows;
+    for (const ix of indexesToCopy) {
       try {
         await tgt.query(ix.indexdef.replace(/^CREATE INDEX/, "CREATE INDEX IF NOT EXISTS"));
         report.indexesCreated++;
@@ -384,13 +523,22 @@ async function copySchemaIfNeeded(
 export async function setupReplication(
   sourceConn: string,
   targetConn: string,
-  opts: { publicationName?: string; subscriptionName?: string } = {},
+  opts: {
+    publicationName?: string;
+    subscriptionName?: string;
+    tables?: string[];
+  } = {},
 ): Promise<ReplicationSetupResult & { schemaReport: SchemaCopyReport }> {
   const pubName = opts.publicationName ?? DEFAULT_PUB;
   const subName = opts.subscriptionName ?? DEFAULT_SUB;
   const startedAt = new Date().toISOString();
+  const selectedTables = await resolveTableSelection(sourceConn, opts.tables);
 
-  const schemaReport = await copySchemaIfNeeded(sourceConn, targetConn);
+  const schemaReport = await copySchemaIfNeeded(
+    sourceConn,
+    targetConn,
+    selectedTables,
+  );
   if (schemaReport.tablesFailed.length > 0) {
     throw new Error(
       `Schema copy failed for ${schemaReport.tablesFailed.length} table(s). First failure: ${schemaReport.tablesFailed[0].name}, ${schemaReport.tablesFailed[0].error}`,
@@ -406,17 +554,44 @@ export async function setupReplication(
       [pubName],
     );
     if (existing.rows.length === 0) {
-      await src.query(`CREATE PUBLICATION "${pubName}" FOR ALL TABLES`);
+      if (selectedTables) {
+        const tableList = selectedTables
+          .map(
+            (table) =>
+              `${quoteIdent(table.schema)}.${quoteIdent(table.table)}`,
+          )
+          .join(", ");
+        await src.query(
+          `CREATE PUBLICATION ${quoteIdent(pubName)} FOR TABLE ${tableList}`,
+        );
+      } else {
+        await src.query(
+          `CREATE PUBLICATION ${quoteIdent(pubName)} FOR ALL TABLES`,
+        );
+      }
     }
     const t = await src.query<{ schema: string; table: string }>(
-      `SELECT n.nspname AS schema, c.relname AS table
-       FROM pg_publication_tables pt
-       JOIN pg_class c ON c.oid = (pt.schemaname || '.' || pt.tablename)::regclass
-       JOIN pg_namespace n ON n.oid = c.relnamespace
-       WHERE pt.pubname = $1`,
+      `SELECT schemaname AS schema, tablename AS table
+       FROM pg_publication_tables
+       WHERE pubname = $1
+       ORDER BY 1, 2`,
       [pubName],
     );
-    tables = t.rows.map((r) => `${r.schema}.${r.table}`);
+    tables = t.rows.map(tableName);
+    if (selectedTables) {
+      const expected = [...selectedTables]
+        .map((table) => table.qualifiedName)
+        .sort();
+      const actual = [...tables].sort();
+      if (
+        expected.length !== actual.length ||
+        expected.some((table, index) => table !== actual[index])
+      ) {
+        throw new Error(
+          `Publication '${pubName}' already exists with a different table selection. Tear it down before starting a different selection.`,
+        );
+      }
+    }
   } finally {
     await src.end();
   }
@@ -429,11 +604,11 @@ export async function setupReplication(
       [subName],
     );
     if (existingSub.rows.length === 0) {
-      // pg.Client doesn't allow parameterized DDL, the connection string
-      // is whitelisted via the env-vars check upstream.
+      // pg.Client doesn't allow parameterized DDL; the connection string is
+      // resolved server-side for the authenticated user's selected project.
       const cleanConn = unpool(sourceConn).replace(/'/g, "''");
       await tgt.query(
-        `CREATE SUBSCRIPTION "${subName}" CONNECTION '${cleanConn}' PUBLICATION "${pubName}" WITH (copy_data = true)`,
+        `CREATE SUBSCRIPTION ${quoteIdent(subName)} CONNECTION '${cleanConn}' PUBLICATION ${quoteIdent(pubName)} WITH (copy_data = true)`,
       );
     }
   } finally {

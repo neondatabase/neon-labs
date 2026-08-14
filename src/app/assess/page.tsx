@@ -121,8 +121,7 @@ export default function NewAssessmentPage() {
         id: "source",
         label: "Source project",
         heading: "Source project",
-        subtitle:
-          "Pick which Neon project to introspect. Defaults to NEON_SOURCE_PROJECT_ID from .env.local if set.",
+        subtitle: "Choose the Neon project you want to assess.",
         valid: sourceReady && sourceVersionKnown,
       },
       {
@@ -199,7 +198,7 @@ export default function NewAssessmentPage() {
                 href={`https://console.neon.tech/app/orgs/${cfg.orgId}`}
                 target="_blank"
                 rel="noreferrer"
-                className="text-label text-primary hover:underline"
+                className="rounded-[2px] text-label text-primary transition-colors duration-150 ease-out hover:text-[#7ff5cf] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
               >
                 Open in Neon Console
               </a>
@@ -255,12 +254,7 @@ export default function NewAssessmentPage() {
                 )}
                 {!sourceReady && (
                   <p className="mt-2 text-caption text-[#f59e0b]">
-                    No source configured. Pick one above (requires a Neon API
-                    key) or set{" "}
-                    <code className="font-mono">
-                      NEON_SOURCE_CONNECTION_STRING
-                    </code>{" "}
-                    in <code className="font-mono">.env.local</code>.
+                    Choose a source project above to continue.
                   </p>
                 )}
               </>
