@@ -246,7 +246,7 @@ export function ProvisionTargetCard({
               href={result.consoleUrl}
               target="_blank"
               rel="noreferrer"
-              className="inline-flex items-center gap-1 text-caption text-[#00e599] hover:underline"
+              className="inline-flex items-center gap-1 rounded-[2px] text-caption text-[#00e599] transition-colors duration-150 ease-out hover:text-[#7ff5cf] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
             >
               Open in Neon Console
               <ExternalLink className="h-3 w-3" />

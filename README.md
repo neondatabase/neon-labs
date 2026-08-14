@@ -70,6 +70,18 @@ unnecessary attack surface for a hosted deployment. Everything the
 analyzer read from those archives came from catalog queries the live
 path already runs.
 
+### Migration
+- **Logical replication** — copies required schema objects, provisions a
+  publication/subscription, monitors the initial copy and replication lag,
+  and guides cutover.
+- **Selected-table replication** — API callers can pass the same
+  `tables: ["schema.table"]` array to
+  `POST /api/neon/replication/preflight` and
+  `POST /api/neon/replication/setup`. The selected tables and their required
+  schemas, sequences, and indexes are copied; omitting `tables` retains the
+  existing all-user-tables behavior. Table names must match the
+  schema-qualified names returned by preflight.
+
 ### Reference
 - **Extensions** — searchable reference of Neon's PG extension support,
   per major version.

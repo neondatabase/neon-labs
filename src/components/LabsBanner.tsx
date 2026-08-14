@@ -14,10 +14,10 @@ export function LabsBanner() {
       />
 
       <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-center gap-x-3 gap-y-1.5 text-center">
-        <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-[#00e599]/25 bg-[#00e599]/[0.08] px-2 py-1 font-mono text-[10px] font-medium uppercase leading-none tracking-[0.12em] text-[#7ff5cf]">
+        <span className="inline-flex shrink-0 items-center gap-1.5 rounded-[3px] border border-[#00e599]/25 bg-[#00e599]/[0.08] px-2 py-1 text-[10px] font-medium uppercase leading-none tracking-[0.12em] text-[#7ff5cf]">
           <span
             aria-hidden="true"
-            className="size-1.5 rounded-[2px] bg-[#00e599] shadow-[0_0_8px_rgba(0,229,153,0.65)]"
+            className="size-1.5 bg-[#00e599] shadow-[0_0_8px_rgba(0,229,153,0.65)]"
           />
           Experimental
         </span>

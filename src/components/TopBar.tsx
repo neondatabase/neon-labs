@@ -9,6 +9,7 @@ import {
   setSourceOverride,
   setTargetOverride,
 } from "@/lib/neon-settings";
+import { setSetupSkipped } from "@/lib/setup-status";
 
 const TITLES: Record<string, string> = {
   "/assess": "New assessment",
@@ -43,6 +44,7 @@ export function TopBar() {
   const [orgName, setOrgName] = useState<string | null>(null);
   const [authenticated, setAuthenticated] = useState(false);
   const [developmentFallback, setDevelopmentFallback] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
 
   useEffect(() => {
     fetch("/api/neon/config")
@@ -67,10 +69,17 @@ export function TopBar() {
   }, []);
 
   async function signOut() {
-    await fetch("/api/auth/logout", { method: "POST" });
-    setSourceOverride(null);
-    setTargetOverride(null);
-    window.location.assign("/");
+    setSigningOut(true);
+    try {
+      const response = await fetch("/api/auth/logout", { method: "POST" });
+      if (!response.ok) throw new Error("Sign out failed");
+      setSourceOverride(null);
+      setTargetOverride(null);
+      setSetupSkipped(false);
+      window.location.replace("/");
+    } catch {
+      setSigningOut(false);
+    }
   }
 
   return (
@@ -103,18 +112,21 @@ export function TopBar() {
           <button
             type="button"
             onClick={signOut}
-            className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-caption text-[#9ca3af] transition-colors duration-150 ease-out hover:bg-[#1a1b1b] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50"
+            disabled={signingOut}
+            className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-caption text-[#9ca3af] transition-colors duration-150 ease-out hover:bg-[#1a1b1b] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50 disabled:cursor-wait disabled:opacity-60"
           >
             <LogOut className="h-3.5 w-3.5" />
-            Sign out
+            {signingOut ? "Signing out…" : "Sign out"}
           </button>
         )}
-        <div
-          title={orgName ?? "Not connected"}
-          className="ml-1 flex h-7 w-7 items-center justify-center rounded-full bg-[#00e599]/15 text-label font-medium text-[#00e599]"
-        >
-          {initials(orgName ?? "Neon Labs")}
-        </div>
+        {(authenticated || developmentFallback) && (
+          <div
+            title={orgName ?? "Connected to Neon"}
+            className="ml-1 flex h-7 w-7 items-center justify-center rounded-full bg-[#00e599]/15 text-label font-medium text-[#00e599]"
+          >
+            {initials(orgName ?? "Neon")}
+          </div>
+        )}
       </div>
     </header>
   );

@@ -396,7 +396,7 @@ export default function ChangesPage() {
                                 href={change.docsUrl}
                                 target="_blank"
                                 rel="noreferrer"
-                                className="relative inline-flex min-h-[24px] w-fit items-center gap-1 rounded-[2px] text-caption text-primary before:absolute before:-inset-x-2 before:-inset-y-2 before:content-[''] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                                className="relative inline-flex min-h-[24px] w-fit items-center gap-1 rounded-[2px] text-caption text-primary transition-colors duration-150 ease-out before:absolute before:-inset-x-2 before:-inset-y-2 before:content-[''] hover:text-[#7ff5cf] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                               >
                                 Postgres release notes
                                 <ExternalLink className="h-3 w-3" />

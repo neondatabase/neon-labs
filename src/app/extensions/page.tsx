@@ -3,7 +3,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
 import type { ColumnDef, SortingState } from "@tanstack/react-table";
-import { NEON_EXTENSIONS, countByStatus } from "@/lib/extensions";
+import {
+  EXTENSION_PG_MAJORS,
+  NEON_EXTENSIONS,
+  countByStatus,
+} from "@/lib/extensions";
 import { PageHeader, StatusBadge, neon } from "@/components/ui";
 import type { ExtensionSupportStatus, NeonExtension } from "@/lib/types";
 import { DataTable } from "@/components/data-table";
@@ -33,17 +37,17 @@ const STATUS_ORDER: Record<ExtensionSupportStatus, number> = {
   not_supported: 3,
 };
 
-const COMPAT: { id: "any" | "pg16" | "pg17"; label: string }[] = [
-  { id: "any", label: "Any version" },
-  { id: "pg16", label: "Runs on PG 16" },
-  { id: "pg17", label: "Runs on PG 17" },
-];
+type ExtensionPgMajor = (typeof EXTENSION_PG_MAJORS)[number];
+type CompatFilter = "any" | `pg${ExtensionPgMajor}`;
+type ExtensionVersionKey = Exclude<CompatFilter, "any">;
 
-const COMPAT_TRIGGER_LABEL: Record<"any" | "pg16" | "pg17", string> = {
-  any: "PG version",
-  pg16: "PG 16",
-  pg17: "PG 17",
-};
+const COMPAT: { id: CompatFilter; label: string }[] = [
+  { id: "any", label: "Any version" },
+  ...EXTENSION_PG_MAJORS.map((major) => ({
+    id: `pg${major}` as ExtensionVersionKey,
+    label: `Runs on PG ${major}`,
+  })),
+];
 
 function compareVersions(a?: string, b?: string) {
   if (!a && !b) return 0;
@@ -57,6 +61,23 @@ function compareVersions(a?: string, b?: string) {
   }
   return 0;
 }
+
+const versionColumns: ColumnDef<NeonExtension, unknown>[] =
+  EXTENSION_PG_MAJORS.map((major) => {
+    const key = `pg${major}` as ExtensionVersionKey;
+    return {
+      id: key,
+      accessorFn: (extension) => extension[key],
+      header: `PG ${major}`,
+      cell: ({ row }) => (
+        <span className="font-mono text-label tnum text-foreground">
+          {row.original[key] ?? "—"}
+        </span>
+      ),
+      sortingFn: (a, b) =>
+        compareVersions(a.original[key], b.original[key]),
+    };
+  });
 
 const columns: ColumnDef<NeonExtension, unknown>[] = [
   {
@@ -75,41 +96,31 @@ const columns: ColumnDef<NeonExtension, unknown>[] = [
     sortingFn: (a, b) =>
       STATUS_ORDER[a.original.status] - STATUS_ORDER[b.original.status],
   },
+  ...versionColumns,
   {
-    accessorKey: "pg16",
-    header: "PG 16",
-    cell: ({ row }) => (
-      <span className="font-mono text-label tnum text-foreground">
-        {row.original.pg16 ?? "—"}
-      </span>
-    ),
-    sortingFn: (a, b) => compareVersions(a.original.pg16, b.original.pg16),
-  },
-  {
-    accessorKey: "pg17",
-    header: "PG 17",
-    cell: ({ row }) => (
-      <span className="font-mono text-label tnum text-foreground">
-        {row.original.pg17 ?? "—"}
-      </span>
-    ),
-    sortingFn: (a, b) => compareVersions(a.original.pg17, b.original.pg17),
-  },
-  {
-    accessorKey: "comments",
+    id: "notes",
+    accessorFn: (extension) =>
+      [extension.description, extension.comments].filter(Boolean).join(" "),
     header: "Notes",
     enableSorting: false,
     cell: ({ row }) => (
-      <span className="block max-w-md whitespace-normal text-caption text-muted-foreground">
-        {row.original.comments ?? "—"}
-      </span>
+      <div className="max-w-md space-y-1 whitespace-normal text-caption">
+        <p className="text-muted-foreground">
+          {row.original.description ?? row.original.comments ?? "—"}
+        </p>
+        {row.original.description &&
+          row.original.comments &&
+          row.original.comments !== row.original.description && (
+            <p className="text-[#fbbf24]">{row.original.comments}</p>
+          )}
+      </div>
     ),
   },
 ];
 
 export default function ExtensionsPage() {
   const [filter, setFilter] = useState<ExtensionSupportStatus | "all">("all");
-  const [compat, setCompat] = useState<"any" | "pg16" | "pg17">("any");
+  const [compat, setCompat] = useState<CompatFilter>("any");
   const [search, setSearch] = useState("");
   const [sorting, setSorting] = useState<SortingState>([
     { id: "name", desc: false },
@@ -136,8 +147,7 @@ export default function ExtensionsPage() {
     () =>
       NEON_EXTENSIONS.filter((ext) => {
         if (filter !== "all" && ext.status !== filter) return false;
-        if (compat === "pg16") return Boolean(ext.pg16);
-        if (compat === "pg17") return Boolean(ext.pg17);
+        if (compat !== "any") return Boolean(ext[compat]);
         return true;
       }),
     [compat, filter]
@@ -166,7 +176,7 @@ export default function ExtensionsPage() {
               {NEON_EXTENSIONS.length} extensions tracked ·{" "}
               <a
                 href="https://neon.com/docs/extensions/pg-extensions"
-                className="text-primary underline"
+                className="rounded-[2px] text-primary underline decoration-primary/40 underline-offset-2 transition-colors duration-150 ease-out hover:text-[#7ff5cf] hover:decoration-[#7ff5cf] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
                 target="_blank"
                 rel="noreferrer"
               >
@@ -207,7 +217,9 @@ export default function ExtensionsPage() {
                       compat === "any" ? "text-muted-foreground" : undefined
                     }
                   >
-                    {COMPAT_TRIGGER_LABEL[compat]}
+                    {compat === "any"
+                      ? "PG version"
+                      : `PG ${compat.replace("pg", "")}`}
                   </span>
                 </SelectTrigger>
                 <SelectContent>

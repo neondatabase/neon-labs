@@ -384,7 +384,7 @@ export function TargetProjectPicker({
               <p>Sign in with Neon to browse and pick projects.</p>
               <a
                 href="/api/auth/neon"
-                className="mt-2 inline-flex text-foreground underline underline-offset-2"
+                className="mt-2 inline-flex rounded-[2px] text-foreground underline decoration-foreground/40 underline-offset-2 transition-colors duration-150 ease-out hover:text-primary hover:decoration-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
               >
                 Sign in with Neon
               </a>

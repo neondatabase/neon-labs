@@ -122,9 +122,8 @@ export default function ImportAssistantPage() {
             <NoticeBody>
               <NoticeTitle>Pick a target project</NoticeTitle>
               <NoticeDescription>
-                Choose the Neon project to import into above, or set
-                NEON_TARGET_CONNECTION_STRING in .env.local. You'll enter the
-                source credentials inside the Neon Console.
+                Choose the Neon project to import into above. You&apos;ll enter
+                the source credentials inside the Neon Console.
               </NoticeDescription>
             </NoticeBody>
           </Notice>
@@ -300,7 +299,7 @@ export default function ImportAssistantPage() {
             href="https://neon.com/docs/import/import-data-assistant"
             target="_blank"
             rel="noreferrer"
-            className="text-[#00e599] hover:underline"
+            className="rounded-[2px] text-[#00e599] transition-colors duration-150 ease-out hover:text-[#7ff5cf] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
             Import Data Assistant
           </a>

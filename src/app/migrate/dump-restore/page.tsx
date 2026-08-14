@@ -192,8 +192,6 @@ export default function DumpRestorePage() {
               <NoticeDescription>
                 A dump and restore needs both sides. Choose them above and the
                 app fetches their direct connection strings from the Neon API.
-                You can also set NEON_SOURCE_CONNECTION_STRING and
-                NEON_TARGET_CONNECTION_STRING in .env.local.
               </NoticeDescription>
             </NoticeBody>
           </Notice>

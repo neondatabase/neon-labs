@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   Copy,
   Database,
+  ExternalLink,
   Loader2,
   PlayCircle,
   Power,
@@ -109,6 +110,7 @@ export default function ReplicationPage() {
   /* The source can come from an in-app pick or the env default, and the
      Neon API calls below need its project id either way. */
   const sourceProjectId = sourceOverride?.projectId ?? cfg?.sourceProjectId ?? null;
+  const targetProjectId = targetOverride?.projectId ?? cfg?.targetProjectId ?? null;
 
   // Routes resolve connection URIs server-side from these project ids. The
   // browser never receives or stores database passwords.
@@ -642,7 +644,7 @@ export default function ReplicationPage() {
               href="https://neon.com/docs/guides/logical-replication-neon-to-neon"
               target="_blank"
               rel="noreferrer"
-              className="text-[#00e599] hover:underline"
+              className="rounded-[2px] text-[#00e599] transition-colors duration-150 ease-out hover:text-[#7ff5cf] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
             >
               Replicate from one Neon project to another
             </a>
@@ -925,7 +927,16 @@ export default function ReplicationPage() {
               r={cutoverResult}
               onCopyConn={() => copyConnectionString(cutoverResult.newPrimaryConnectionString)}
               copiedConn={copiedConn}
-              targetProjectId={targetOverride?.projectId ?? cfg?.targetProjectId ?? null}
+              sourceProjectId={sourceProjectId}
+              sourceProjectName={sourceOverride?.projectName ?? sourceProjectId}
+              sourcePgVersion={
+                preflight?.source.pgVersion ?? sourceOverride?.pgVersion ?? null
+              }
+              targetProjectId={targetProjectId}
+              targetProjectName={targetOverride?.projectName ?? targetProjectId}
+              targetPgVersion={
+                preflight?.target.pgVersion ?? targetOverride?.pgVersion ?? null
+              }
             />
           </Section>
         )}
@@ -1604,12 +1615,22 @@ function CutoverResultDetails({
   r,
   onCopyConn,
   copiedConn,
+  sourceProjectId,
+  sourceProjectName,
+  sourcePgVersion,
   targetProjectId,
+  targetProjectName,
+  targetPgVersion,
 }: {
   r: CutoverResult;
   onCopyConn: () => void;
   copiedConn: boolean;
+  sourceProjectId: string | null;
+  sourceProjectName: string | null;
+  sourcePgVersion: number | null;
   targetProjectId: string | null;
+  targetProjectName: string | null;
+  targetPgVersion: number | null;
 }) {
   const statusColor: Record<string, string> = {
     ok: "text-[#00e599]",
@@ -1620,15 +1641,140 @@ function CutoverResultDetails({
   };
   return (
     <div className="space-y-4">
+      <div className="px-4 py-2 text-center">
+        <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-[8px] border border-[#00e599]/25 bg-[#00e599]/10 text-[#00e599]">
+          <CheckCircle2 className="h-5 w-5" />
+        </div>
+        <h3 className="mt-4 text-heading font-medium text-foreground">
+          Migration successful
+        </h3>
+        <p className="mt-1 text-caption text-[#9ca3af]">
+          {sourcePgVersion && targetPgVersion ? (
+            <>
+              Your database has been migrated from{" "}
+              <span className="font-mono text-foreground">
+                PG {sourcePgVersion}
+              </span>{" "}
+              to{" "}
+              <span className="font-mono text-[#00e599]">
+                PG {targetPgVersion}
+              </span>
+              .
+            </>
+          ) : (
+            "Logical replication cutover completed successfully."
+          )}
+        </p>
+      </div>
+
+      <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-4">
+        <p className="tag mb-3">Migration summary</p>
+        <dl className="space-y-2 text-caption">
+          {[
+            ["Method", "Logical replication"],
+            [
+              "Source version",
+              sourcePgVersion ? `PG ${sourcePgVersion}` : "—",
+            ],
+            [
+              "Target version",
+              targetPgVersion ? `PG ${targetPgVersion}` : "—",
+            ],
+            ["Source project", sourceProjectName ?? "—"],
+            ["Target project", targetProjectName ?? "—"],
+          ].map(([label, value]) => (
+            <div className="flex items-start justify-between gap-6" key={label}>
+              <dt className="text-[#9ca3af]">{label}</dt>
+              <dd
+                className={
+                  label === "Target version"
+                    ? "text-right font-mono text-[#00e599]"
+                    : "text-right text-foreground"
+                }
+              >
+                {value}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+
+      {/* New primary banner */}
+      <div className="rounded-[4px] border border-[#00e599]/40 bg-[#00e599]/[0.06] p-4">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <p className="tag text-[#00e599]">New primary connection string</p>
+          <Button size="lg" variant="ghost" onClick={onCopyConn}>
+            {copiedConn ? (
+              <>
+                <CheckCircle2 className="h-3.5 w-3.5 text-[#00e599]" />
+                Full connection string copied
+              </>
+            ) : (
+              <>
+                <Copy className="h-3.5 w-3.5" />
+                Copy full connection string
+              </>
+            )}
+          </Button>
+        </div>
+        <p className="break-all font-mono text-label text-[#f3f4f6]">
+          {r.newPrimaryConnectionString.replace(/:([^:@]+)@/, ":••••••@")}
+        </p>
+        <p className="mt-2 text-label text-[#9ca3af]">
+          The password is hidden in this preview. Copying includes the complete
+          connection string.
+        </p>
+        {targetProjectId && (
+          <p className="mt-1 text-label text-[#9ca3af]">
+            The Console's Connect button will show this project's connection
+            strings for every role and database, plus a one-click Connect
+            modal you can copy into your app.
+          </p>
+        )}
+        {(sourceProjectId || targetProjectId) && (
+          <div className="mt-4 flex flex-wrap items-center justify-center gap-x-5 gap-y-2 border-t border-[#00e599]/15 pt-3 text-caption">
+            {sourceProjectId && (
+              <a
+                href={`https://console.neon.tech/app/projects/${sourceProjectId}`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-[2px] text-[#9ca3af] transition-colors duration-150 ease-out hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50"
+              >
+                Source project
+                <ExternalLink className="h-3 w-3" />
+              </a>
+            )}
+            {targetProjectId && (
+              <a
+                href={`https://console.neon.tech/app/projects/${targetProjectId}`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-[2px] text-[#00e599] transition-colors duration-150 ease-out hover:text-[#7ff5cf] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50"
+              >
+                Target project
+                <ExternalLink className="h-3 w-3" />
+              </a>
+            )}
+          </div>
+        )}
+      </div>
+
       {/* Step log */}
       <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
         <p className="tag mb-2">Cutover timeline</p>
         <div className="space-y-1.5">
           {r.steps.map((s) => (
-            <div key={s.id} className="flex items-start justify-between gap-3 text-caption">
+            <div
+              key={s.id}
+              className="flex items-start justify-between gap-3 text-caption"
+            >
               <div className="flex min-w-0 items-start gap-2">
                 <span className={`font-mono ${statusColor[s.status] ?? ""}`}>
-                  {s.status === "ok" ? "✓" : s.status === "failed" ? "✗" : "·"}
+                  {s.status === "ok"
+                    ? "✓"
+                    : s.status === "failed"
+                      ? "✗"
+                      : "·"}
                 </span>
                 <div className="min-w-0">
                   <span className="text-foreground">{s.label}</span>
@@ -1645,49 +1791,6 @@ function CutoverResultDetails({
             </div>
           ))}
         </div>
-      </div>
-
-      {/* New primary banner */}
-      <div className="rounded-[4px] border border-[#00e599]/40 bg-[#00e599]/[0.06] p-4">
-        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-          <p className="tag text-[#00e599]">New primary connection string</p>
-          <div className="flex gap-2">
-            <Button size="lg" variant="ghost" onClick={onCopyConn}>
-              {copiedConn ? (
-                <>
-                  <CheckCircle2 className="h-3.5 w-3.5 text-[#00e599]" />
-                  Copied
-                </>
-              ) : (
-                <>
-                  <Copy className="h-3.5 w-3.5" />
-                  Copy
-                </>
-              )}
-            </Button>
-            {targetProjectId && (
-              <a
-                href={`https://console.neon.tech/app/projects/${targetProjectId}`}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1.5 rounded-full bg-white px-3 py-1 text-caption font-medium text-[#0c0d0d] transition-[scale,background-color,border-color,color] duration-150 ease-out active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c0d0d] hover:bg-[#f3f4f6]"
-              >
-                Open in Neon Console
-                <ArrowRight className="h-3 w-3" />
-              </a>
-            )}
-          </div>
-        </div>
-        <p className="break-all font-mono text-label text-[#f3f4f6]">
-          {r.newPrimaryConnectionString.replace(/:([^:@]+)@/, ":••••••@")}
-        </p>
-        {targetProjectId && (
-          <p className="mt-2 text-label text-[#9ca3af]">
-            The Console's Connect button will show this project's connection
-            strings for every role and database, plus a one-click Connect
-            modal you can copy into your app.
-          </p>
-        )}
       </div>
 
       {/* Post-cutover checklist */}

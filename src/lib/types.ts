@@ -102,8 +102,12 @@ export type ExtensionSupportStatus =
 export interface NeonExtension {
   name: string;
   status: ExtensionSupportStatus;
+  pg14?: string;
+  pg15?: string;
   pg16?: string;
   pg17?: string;
+  pg18?: string;
+  description?: string;
   comments?: string;
 }
 
