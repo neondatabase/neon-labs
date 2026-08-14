@@ -85,6 +85,22 @@ export async function getCurrentUser(accessToken: string) {
   return neonFetch<NeonCurrentUser>("/users/me", accessToken);
 }
 
+export interface NeonRegion {
+  region_id: string;
+  name: string;
+  default: boolean;
+}
+
+export async function listRegions(accessToken: string, orgId?: string) {
+  const params = new URLSearchParams();
+  if (orgId) params.set("org_id", orgId);
+  const query = params.toString();
+  return neonFetch<{ regions: NeonRegion[] }>(
+    `/regions${query ? `?${query}` : ""}`,
+    accessToken,
+  );
+}
+
 export async function listOrganizations(accessToken: string) {
   return neonFetch<{ organizations: NeonOrganization[] }>(
     "/users/me/organizations",

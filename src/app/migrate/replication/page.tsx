@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertOctagon,
   AlertTriangle,
@@ -101,6 +101,10 @@ export default function ReplicationPage() {
   const [copiedSql, setCopiedSql] = useState<string | null>(null);
   const [targetOverride, setTargetOverrideState] = useState<TargetOverride | null>(null);
   const [sourceOverride, setSourceOverrideState] = useState<TargetOverride | null>(null);
+  const [selectedTables, setSelectedTables] = useState<string[]>([]);
+  const [tableSelectionReady, setTableSelectionReady] = useState(false);
+  const [resumedSession, setResumedSession] = useState(false);
+  const recoveryChecks = useRef(new Set<string>());
 
   useEffect(() => {
     setTargetOverrideState(getTargetOverride());
@@ -114,12 +118,24 @@ export default function ReplicationPage() {
 
   // Routes resolve connection URIs server-side from these project ids. The
   // browser never receives or stores database passwords.
-  const targetBody = () => {
-    const body: Record<string, string> = {};
+  const targetBody = useCallback((includeTables = false) => {
+    const body: {
+      sourceProjectId?: string;
+      targetProjectId?: string;
+      tables?: string[];
+    } = {};
     if (sourceOverride?.projectId) body.sourceProjectId = sourceOverride.projectId;
     if (targetOverride?.projectId) body.targetProjectId = targetOverride.projectId;
+    if (includeTables && tableSelectionReady) {
+      body.tables = selectedTables;
+    }
     return body;
-  };
+  }, [
+    selectedTables,
+    sourceOverride,
+    tableSelectionReady,
+    targetOverride,
+  ]);
 
   /** Extract structured error from a response body and surface both
       raw + classified state. Returns the message to throw for normal flow. */
@@ -138,6 +154,63 @@ export default function ReplicationPage() {
       .catch(() => setCfg(null));
   }, []);
 
+  useEffect(() => {
+    if (
+      !cfg?.authenticated ||
+      !sourceProjectId ||
+      !targetProjectId ||
+      setup ||
+      phase !== "idle"
+    ) {
+      return;
+    }
+    const key = `${sourceProjectId}:${targetProjectId}`;
+    if (recoveryChecks.current.has(key)) return;
+    recoveryChecks.current.add(key);
+
+    let cancelled = false;
+    void fetch("/api/neon/replication/status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(targetBody()),
+    })
+      .then(async (response) => {
+        if (!response.ok) return null;
+        return (await response.json()) as ReplicationStatus;
+      })
+      .then((existingStatus) => {
+        if (cancelled || !existingStatus?.subscribed) return;
+        const tables = existingStatus.perTable.map((table) => table.table);
+        setStatus(existingStatus);
+        setSetup({
+          publicationName: "neon_advisor_pub",
+          subscriptionName: existingStatus.subscriptionName,
+          tables,
+          startedAt: "",
+          walLevelChanged: false,
+          schemaCopied: true,
+        });
+        setSelectedTables(tables);
+        setTableSelectionReady(true);
+        setResumedSession(true);
+        setPhase("monitoring");
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    cfg?.authenticated,
+    phase,
+    setup,
+    sourceProjectId,
+    sourceOverride,
+    targetBody,
+    targetProjectId,
+    targetOverride,
+  ]);
+
   // Auto-poll status during monitoring phase
   const pollStatus = useCallback(async () => {
     try {
@@ -151,7 +224,7 @@ export default function ReplicationPage() {
     } catch {
       /* swallow polling errors */
     }
-  }, [sourceOverride, targetOverride]);
+  }, [targetBody]);
 
   useEffect(() => {
     if (phase !== "monitoring") return;
@@ -167,12 +240,16 @@ export default function ReplicationPage() {
       const res = await fetch("/api/neon/replication/preflight", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(targetBody()),
+        body: JSON.stringify(targetBody(tableSelectionReady)),
       });
       const body = await res.json();
       if (!res.ok) throw new Error(handleApiError(body, `Failed (${res.status})`));
       setClassifiedError(null);
       setPreflight(body);
+      if (!tableSelectionReady) {
+        setSelectedTables(body.source.tables);
+        setTableSelectionReady(true);
+      }
       setPhase("preflight-done");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Preflight failed");
@@ -211,11 +288,12 @@ export default function ReplicationPage() {
   async function runSetup() {
     setPhase("setting-up");
     setError(null);
+    setResumedSession(false);
     try {
       const res = await fetch("/api/neon/replication/setup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(targetBody()),
+        body: JSON.stringify(targetBody(true)),
       });
       const body = await res.json();
       if (!res.ok) throw new Error(handleApiError(body, `Failed (${res.status})`));
@@ -244,6 +322,7 @@ export default function ReplicationPage() {
       setClassifiedError(null);
       setSetup(null);
       setStatus(null);
+      setResumedSession(false);
       setCutoverPre(null);
       setCutoverResult(null);
       setPhase("idle");
@@ -366,7 +445,7 @@ export default function ReplicationPage() {
     } finally {
       setMonitorLoading(false);
     }
-  }, [sourceOverride, targetOverride]);
+  }, [targetBody]);
 
   useEffect(() => {
     if (!monitorAutopoll) return;
@@ -473,6 +552,9 @@ export default function ReplicationPage() {
             setMonitor(null);
             setCutoverPre(null);
             setCutoverResult(null);
+            setSelectedTables([]);
+            setTableSelectionReady(false);
+            setResumedSession(false);
             setPhase("idle");
           }}
         />
@@ -488,6 +570,7 @@ export default function ReplicationPage() {
             setMonitor(null);
             setCutoverPre(null);
             setCutoverResult(null);
+            setResumedSession(false);
             setPhase("idle");
           }}
         />
@@ -757,10 +840,16 @@ export default function ReplicationPage() {
                   size="lg"
                   variant="white"
                   onClick={runSetup}
-                  disabled={!preflight.ok || phase === "setting-up"}
+                  disabled={
+                    !preflight.ok ||
+                    selectedTables.length === 0 ||
+                    phase === "setting-up"
+                  }
                   title={
                     !preflight.ok
                       ? "Resolve the preflight blockers before starting replication."
+                      : selectedTables.length === 0
+                        ? "Select at least one table to replicate."
                       : undefined
                   }
                 >
@@ -780,10 +869,19 @@ export default function ReplicationPage() {
                   <p className="text-label text-[#f59e0b]">
                     Resolve the preflight blockers above to continue.
                   </p>
+                ) : selectedTables.length === 0 ? (
+                  <p className="text-label text-[#f59e0b]">
+                    Select at least one table to continue.
+                  </p>
                 ) : null}
               </div>
             }
           >
+            <TableSelection
+              tables={preflight.source.tables}
+              selectedTables={selectedTables}
+              onChange={setSelectedTables}
+            />
             <ol className="space-y-2 text-caption text-[#f3f4f6]">
               <li>
                 <span className="font-mono text-[#00e599]">01</span> Copy extensions + table
@@ -791,7 +889,8 @@ export default function ReplicationPage() {
               </li>
               <li>
                 <span className="font-mono text-[#00e599]">02</span> CREATE PUBLICATION{" "}
-                <span className="font-mono">neon_advisor_pub</span> FOR ALL TABLES on source
+                <span className="font-mono">neon_advisor_pub</span> for the{" "}
+                {selectedTables.length} selected table(s)
               </li>
               <li>
                 <span className="font-mono text-[#00e599]">03</span> CREATE SUBSCRIPTION{" "}
@@ -821,6 +920,12 @@ export default function ReplicationPage() {
               </div>
             }
           >
+            {resumedSession ? (
+              <div className="mb-3 rounded-[4px] border border-[#00e599]/30 bg-[#00e599]/[0.06] px-3 py-2 text-caption text-[#00e599]">
+                Existing replication detected. Monitoring resumed after the
+                page refresh; the database copy continued in Postgres.
+              </div>
+            ) : null}
             {status ? <StatusDetails s={status} /> : (
               <p className={`text-caption ${neon.muted}`}>Awaiting first status poll…</p>
             )}
@@ -1110,6 +1215,74 @@ function Section({
   );
 }
 
+function TableSelection({
+  tables,
+  selectedTables,
+  onChange,
+}: {
+  tables: string[];
+  selectedTables: string[];
+  onChange: (tables: string[]) => void;
+}) {
+  const selected = new Set(selectedTables);
+  return (
+    <div className="mb-4 rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="text-caption font-medium text-foreground">
+            Tables to replicate
+          </p>
+          <p className="mt-0.5 text-label text-[#9ca3af]">
+            {selectedTables.length} of {tables.length} selected
+          </p>
+        </div>
+        <div className="flex gap-1">
+          <Button
+            onClick={() => onChange(tables)}
+            size="xs"
+            type="button"
+            variant="ghost"
+          >
+            Select all
+          </Button>
+          <Button
+            onClick={() => onChange([])}
+            size="xs"
+            type="button"
+            variant="ghost"
+          >
+            Clear
+          </Button>
+        </div>
+      </div>
+      <div className="mt-3 grid max-h-44 gap-1 overflow-y-auto sm:grid-cols-2">
+        {tables.map((table) => (
+          <label
+            className="flex cursor-pointer items-center gap-2 rounded-[3px] px-2 py-1.5 text-label text-foreground hover:bg-[#1a1b1b]"
+            key={table}
+          >
+            <input
+              checked={selected.has(table)}
+              className="size-3.5 accent-[#00e599]"
+              onChange={(event) =>
+                onChange(
+                  event.target.checked
+                    ? [...selectedTables, table]
+                    : selectedTables.filter((item) => item !== table),
+                )
+              }
+              type="checkbox"
+            />
+            <span className="truncate font-mono" title={table}>
+              {table}
+            </span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function PreflightDetails({ p }: { p: ReplicationPreflight }) {
   return (
     <div className="grid gap-3 sm:grid-cols-2">
@@ -1289,6 +1462,9 @@ function MonitorDetails({
     Initialize: "text-[#4f9eed]",
     Unknown: "text-[#9ca3af]",
   };
+  const readyTables = m.subscriber.filter(
+    (table) => table.tableStatus === "Ready",
+  ).length;
   return (
     <div className="space-y-4">
       {/* Top-level verdict */}
@@ -1305,10 +1481,18 @@ function MonitorDetails({
             Initial replication complete — every table is Ready.
           </>
         ) : (
-          <>
-            <Loader2 className="mr-1.5 inline h-3.5 w-3.5 animate-spin" />
-            Initial replication still in progress.
-          </>
+          <div>
+            <p>
+              <Loader2 className="mr-1.5 inline h-3.5 w-3.5 animate-spin" />
+              Initial replication still in progress — {readyTables} of{" "}
+              {m.subscriber.length} tables Ready.
+            </p>
+            <p className="mt-1 pl-5 text-label text-[#d6a44c]">
+              Large databases can take minutes to hours. You can safely leave
+              or refresh this page; replication continues in Postgres. Wait
+              until every table is Ready and lag is near zero before cutover.
+            </p>
+          </div>
         )}
       </div>
 

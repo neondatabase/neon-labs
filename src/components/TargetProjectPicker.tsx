@@ -16,6 +16,14 @@ import {
   type KeyboardEvent,
 } from "react";
 import { Button } from "./ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "./ui/dialog";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
@@ -57,6 +65,12 @@ interface OrganizationGroup {
 interface FailedOrganization {
   id: string;
   name: string;
+}
+
+interface RegionOption {
+  region_id: string;
+  name: string;
+  default: boolean;
 }
 
 interface ProjectsResponse {
@@ -134,6 +148,10 @@ export function TargetProjectPicker({
   const [newProjectName, setNewProjectName] = useState("");
   const [newTargetPgVersion, setNewTargetPgVersion] =
     useState<PgMajorVersion>(targetPgVersion);
+  const [regions, setRegions] = useState<RegionOption[]>([]);
+  const [regionsLoading, setRegionsLoading] = useState(false);
+  const [newTargetRegion, setNewTargetRegion] = useState("");
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const authenticated = Boolean(cfg?.authenticated);
@@ -157,7 +175,7 @@ export function TargetProjectPicker({
   }, [open]);
 
   async function refresh() {
-    if (!authenticated) return;
+    if (!authenticated) return [];
     setLoading(true);
     setError(null);
     try {
@@ -183,8 +201,10 @@ export function TargetProjectPicker({
       }
       setOrganizations(body.organizations ?? []);
       setFailedOrganizations(body.failedOrganizations ?? []);
+      return body.organizations ?? [];
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "List failed");
+      return [];
     } finally {
       setLoading(false);
     }
@@ -268,11 +288,59 @@ export function TargetProjectPicker({
     }
   }
 
+  async function loadRegions(organization: OrganizationGroup) {
+    setRegionsLoading(true);
+    try {
+      const response = await fetch(
+        `/api/neon/regions?orgId=${encodeURIComponent(organization.id)}`,
+      );
+      const body = (await response.json()) as {
+        regions?: RegionOption[];
+        error?: string;
+      };
+      if (!response.ok) {
+        throw new Error(body.error ?? `Failed (${response.status})`);
+      }
+      const availableRegions = body.regions ?? [];
+      setRegions(availableRegions);
+      const sourceRegion = getSourceOverride()?.regionId;
+      setNewTargetRegion(
+        availableRegions.find((region) => region.region_id === sourceRegion)
+          ?.region_id ??
+          availableRegions.find((region) => region.default)?.region_id ??
+          availableRegions[0]?.region_id ??
+          sourceRegion ??
+          "",
+      );
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : "Failed to list regions",
+      );
+    } finally {
+      setRegionsLoading(false);
+    }
+  }
+
   function beginCreate(organization: OrganizationGroup) {
+    const sourceRegion = getSourceOverride()?.regionId ?? "";
     setCreateOrg(organization);
     setNewTargetPgVersion(targetPgVersion);
     setNewProjectName(defaultTargetName(targetPgVersion));
+    setRegions([]);
+    setNewTargetRegion(sourceRegion);
     setError(null);
+    void loadRegions(organization);
+  }
+
+  async function openCreateDialog() {
+    setCreateDialogOpen(true);
+    const availableOrganizations =
+      organizations.length > 0 ? organizations : await refresh();
+    const sourceOrgId = getSourceOverride()?.orgId;
+    const organization =
+      availableOrganizations.find((item) => item.id === sourceOrgId) ??
+      availableOrganizations[0];
+    if (organization) beginCreate(organization);
   }
 
   async function createAndSelect(event: FormEvent) {
@@ -288,7 +356,7 @@ export function TargetProjectPicker({
         body: JSON.stringify({
           name,
           pgVersion: newTargetPgVersion,
-          regionId: "aws-us-west-2",
+          regionId: newTargetRegion || undefined,
           orgId: createOrg.id,
         }),
       });
@@ -306,6 +374,7 @@ export function TargetProjectPicker({
       });
       setCreateOrg(null);
       setNewProjectName("");
+      setCreateDialogOpen(false);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Create failed");
     } finally {
@@ -314,7 +383,7 @@ export function TargetProjectPicker({
   }
 
   return (
-    <div className={className}>
+    <div className={cn("flex items-start gap-2", className)}>
       <Popover
         open={open}
         onOpenChange={(next) => {
@@ -324,6 +393,8 @@ export function TargetProjectPicker({
             setHighlightedId(null);
             setCreateOrg(null);
             if (organizations.length === 0 && authenticated) void refresh();
+          } else {
+            setCreateOrg(null);
           }
         }}
       >
@@ -445,22 +516,6 @@ export function TargetProjectPicker({
                           ? "project"
                           : "projects"}
                       </span>
-                      {!isSource ? (
-                        <Button
-                          aria-label={`Create target in ${organization.name}`}
-                          onClick={() => beginCreate(organization)}
-                          size="xs"
-                          type="button"
-                          variant="ghost"
-                        >
-                          <HugeiconsIcon
-                            aria-hidden="true"
-                            icon={PlusSignIcon}
-                            strokeWidth={2}
-                          />
-                          New target
-                        </Button>
-                      ) : null}
                     </div>
 
                     {createOrg?.id === organization.id ? (
@@ -489,6 +544,7 @@ export function TargetProjectPicker({
                                 if (event.key === "Escape") {
                                   setCreateOrg(null);
                                   setNewProjectName("");
+                                  setOpen(false);
                                 }
                               }}
                               value={newProjectName}
@@ -535,11 +591,56 @@ export function TargetProjectPicker({
                             </Select>
                           </div>
                         </div>
+                        <div>
+                          <Label
+                            className="mb-1 text-[10px] text-muted-foreground"
+                            htmlFor={`new-target-region-${organization.id}`}
+                          >
+                            Region
+                          </Label>
+                          <Select
+                            disabled={regionsLoading || regions.length === 0}
+                            onValueChange={(value) =>
+                              setNewTargetRegion(String(value))
+                            }
+                            value={newTargetRegion}
+                          >
+                            <SelectTrigger
+                              className="h-8 w-full rounded-md text-xs"
+                              id={`new-target-region-${organization.id}`}
+                            >
+                              <SelectValue
+                                placeholder={
+                                  regionsLoading
+                                    ? "Loading regions…"
+                                    : "Select a region"
+                                }
+                              />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {regions.map((region) => (
+                                <SelectItem
+                                  key={region.region_id}
+                                  value={region.region_id}
+                                >
+                                  {region.name} · {region.region_id}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          {getSourceOverride()?.regionId ===
+                          newTargetRegion ? (
+                            <p className="mt-1 text-[10px] text-muted-foreground">
+                              Same region as source
+                            </p>
+                          ) : null}
+                        </div>
                         <div className="flex justify-end gap-2">
                           <Button
                             onClick={() => {
                               setCreateOrg(null);
                               setNewProjectName("");
+                              setOpen(false);
                             }}
                             size="xs"
                             type="button"
@@ -548,7 +649,12 @@ export function TargetProjectPicker({
                             Cancel
                           </Button>
                           <Button
-                            disabled={creating || !newProjectName.trim()}
+                            disabled={
+                              creating ||
+                              regionsLoading ||
+                              !newProjectName.trim() ||
+                              !newTargetRegion
+                            }
                             size="xs"
                             type="submit"
                           >
@@ -657,6 +763,187 @@ export function TargetProjectPicker({
           )}
         </PopoverContent>
       </Popover>
+      {!isSource ? (
+        <>
+          <Button
+            disabled={!authenticated}
+            onClick={() => void openCreateDialog()}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            <HugeiconsIcon
+              aria-hidden="true"
+              icon={PlusSignIcon}
+              strokeWidth={2}
+            />
+            New target
+          </Button>
+          <Dialog
+            onOpenChange={(next) => {
+              setCreateDialogOpen(next);
+              if (!next) {
+                setCreateOrg(null);
+                setError(null);
+              }
+            }}
+            open={createDialogOpen}
+          >
+            <DialogContent>
+              <form className="space-y-4" onSubmit={createAndSelect}>
+                <DialogHeader>
+                  <DialogTitle>Create target project</DialogTitle>
+                  <DialogDescription>
+                    Choose the organization, Postgres version, and region. The
+                    source region is selected by default when available.
+                  </DialogDescription>
+                </DialogHeader>
+
+                <div>
+                  <Label className="mb-1" htmlFor="new-target-organization">
+                    Organization
+                  </Label>
+                  <Select
+                    onValueChange={(value) => {
+                      const organization = organizations.find(
+                        (item) => item.id === value,
+                      );
+                      if (organization) beginCreate(organization);
+                    }}
+                    value={createOrg?.id ?? ""}
+                  >
+                    <SelectTrigger
+                      className="w-full"
+                      id="new-target-organization"
+                    >
+                      <SelectValue placeholder="Select an organization" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {organizations.map((organization) => (
+                        <SelectItem
+                          key={organization.id}
+                          value={organization.id}
+                        >
+                          {organization.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div>
+                  <Label className="mb-1" htmlFor="new-target-dialog-name">
+                    Project name
+                  </Label>
+                  <Input
+                    id="new-target-dialog-name"
+                    onChange={(event) => setNewProjectName(event.target.value)}
+                    value={newProjectName}
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <Label className="mb-1" htmlFor="new-target-dialog-version">
+                      Postgres version
+                    </Label>
+                    <Select
+                      onValueChange={(value) => {
+                        const nextVersion = Number(value) as PgMajorVersion;
+                        setNewProjectName((currentName) =>
+                          currentName === defaultTargetName(newTargetPgVersion)
+                            ? defaultTargetName(nextVersion)
+                            : currentName,
+                        );
+                        setNewTargetPgVersion(nextVersion);
+                      }}
+                      value={String(newTargetPgVersion)}
+                    >
+                      <SelectTrigger
+                        className="w-full"
+                        id="new-target-dialog-version"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {NEON_SUPPORTED_VERSIONS.map((version) => (
+                          <SelectItem key={version} value={String(version)}>
+                            PG {version}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div>
+                    <Label className="mb-1" htmlFor="new-target-dialog-region">
+                      Region
+                    </Label>
+                    <Select
+                      disabled={regionsLoading || regions.length === 0}
+                      onValueChange={(value) =>
+                        setNewTargetRegion(String(value))
+                      }
+                      value={newTargetRegion}
+                    >
+                      <SelectTrigger
+                        className="w-full"
+                        id="new-target-dialog-region"
+                      >
+                        <SelectValue
+                          placeholder={
+                            regionsLoading ? "Loading…" : "Select region"
+                          }
+                        />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {regions.map((region) => (
+                          <SelectItem
+                            key={region.region_id}
+                            value={region.region_id}
+                          >
+                            {region.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+
+                {getSourceOverride()?.regionId === newTargetRegion ? (
+                  <p className="text-xs text-muted-foreground">
+                    Same region as source: {newTargetRegion}
+                  </p>
+                ) : null}
+                {error ? (
+                  <p className="text-xs text-destructive">{error}</p>
+                ) : null}
+
+                <DialogFooter>
+                  <Button
+                    onClick={() => setCreateDialogOpen(false)}
+                    type="button"
+                    variant="ghost"
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    disabled={
+                      creating ||
+                      regionsLoading ||
+                      !createOrg ||
+                      !newProjectName.trim() ||
+                      !newTargetRegion
+                    }
+                    type="submit"
+                  >
+                    {creating ? "Creating…" : "Create project"}
+                  </Button>
+                </DialogFooter>
+              </form>
+            </DialogContent>
+          </Dialog>
+        </>
+      ) : null}
     </div>
   );
 }
