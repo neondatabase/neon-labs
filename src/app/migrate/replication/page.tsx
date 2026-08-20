@@ -188,6 +188,7 @@ export default function ReplicationPage() {
         throw new Error(body?.error ?? "Replication resource inspection failed");
       }
       const inspection = body as ReplicationResourceInspection;
+      setError(null);
       setTeardownInspection(inspection);
       return inspection;
     } catch (inspectionError) {
@@ -202,7 +203,9 @@ export default function ReplicationPage() {
     }
   }, [targetBody]);
 
-  const executeTeardownRequest = useCallback(async () => {
+  const executeTeardownRequest = useCallback(async (
+    options: { releaseActiveSlot?: boolean } = {},
+  ) => {
     setPhase("tearing-down");
     setError(null);
     try {
@@ -213,6 +216,12 @@ export default function ReplicationPage() {
           ...targetBody(),
           action: "execute",
           confirm: true,
+          ...(options.releaseActiveSlot
+            ? {
+                releaseActiveSlot: true,
+                confirmReleaseActiveSlot: true,
+              }
+            : {}),
         }),
       });
       const body = await response.json();
@@ -502,6 +511,12 @@ export default function ReplicationPage() {
     if (!confirmTeardown) return;
     setTeardownRecheckAttempts(0);
     await executeTeardownRequest();
+  }
+
+  async function releaseActiveSlotAndTeardown() {
+    if (!confirmTeardown) return;
+    setTeardownRecheckAttempts(0);
+    await executeTeardownRequest({ releaseActiveSlot: true });
   }
 
   async function runCutoverPreflight() {
@@ -1397,7 +1412,7 @@ export default function ReplicationPage() {
                     void copySql("active-slot-inspection", sql)
                   }
                   onConfirmedChange={setConfirmTeardown}
-                  onRetryCleanup={runTeardown}
+                  onReleaseActiveSlot={releaseActiveSlotAndTeardown}
                   onTeardown={runTeardown}
                 />
               ) : null}
@@ -2022,7 +2037,7 @@ function TeardownPanel({
   inspectionSqlCopied,
   onCopyInspectionSql,
   onConfirmedChange,
-  onRetryCleanup,
+  onReleaseActiveSlot,
   onTeardown,
 }: {
   inspection: ReplicationResourceInspection;
@@ -2036,7 +2051,7 @@ function TeardownPanel({
   inspectionSqlCopied: boolean;
   onCopyInspectionSql: (sql: string) => void;
   onConfirmedChange: (confirmed: boolean) => void;
-  onRetryCleanup: () => void;
+  onReleaseActiveSlot: () => void;
   onTeardown: () => void;
 }) {
   const stateColor = (state: string) =>
@@ -2221,9 +2236,9 @@ WHERE pid = ${inspection.slot.activePid};`
 
           <p className="text-label leading-[1.55] text-[#f3f4f6]">
             Confirm the PID belongs to this replication attempt before ending
-            it. This advisor will not call{" "}
-            <span className="font-mono">pg_terminate_backend</span> or force-drop
-            an active slot.
+            it. The advisor calls{" "}
+            <span className="font-mono">pg_terminate_backend</span> only after
+            this explicit confirmation and never force-drops an active slot.
           </p>
 
           <div className="border-t border-[#f59e0b]/25 pt-3">
@@ -2248,16 +2263,16 @@ WHERE pid = ${inspection.slot.activePid};`
             <Button
               className="mt-3"
               disabled={!confirmed || checking || busy}
-              onClick={onRetryCleanup}
+              onClick={onReleaseActiveSlot}
               size="lg"
               variant="outline"
             >
-              {checking ? (
+              {busy ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
               ) : (
-                <RefreshCw className="h-3.5 w-3.5" />
+                <Power className="h-3.5 w-3.5" />
               )}
-              Retry cleanup
+              {busy ? "Ending session…" : "End session and finish cleanup"}
             </Button>
           </div>
         </div>
@@ -2279,7 +2294,9 @@ WHERE pid = ${inspection.slot.activePid};`
               type="checkbox"
             />
             <span>
-              {setupRecovery
+              {activeOrphan
+                ? `I understand that cleanup will end the app-owned replication session${inspection.slot.activePid ? ` on PID ${inspection.slot.activePid}` : ""}, then remove its slot and publication.`
+                : setupRecovery
                 ? "I understand that cleanup permanently removes these partial replication resources."
                 : "I understand that teardown permanently stops replication and removes the replication-based rollback path."}
             </span>

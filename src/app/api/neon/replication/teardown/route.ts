@@ -12,6 +12,8 @@ export async function POST(request: NextRequest) {
   let body: Parameters<typeof resolveConnections>[0] & {
     action?: "inspect" | "execute";
     confirm?: boolean;
+    releaseActiveSlot?: unknown;
+    confirmReleaseActiveSlot?: unknown;
     publicationName?: unknown;
     subscriptionName?: unknown;
     slotName?: unknown;
@@ -31,6 +33,15 @@ export async function POST(request: NextRequest) {
         error:
           "Replication resource names are fixed by this application and cannot be supplied by the client.",
       },
+      { status: 400 },
+    );
+  }
+  if (
+    body.releaseActiveSlot !== undefined &&
+    typeof body.releaseActiveSlot !== "boolean"
+  ) {
+    return NextResponse.json(
+      { error: "releaseActiveSlot must be a boolean." },
       { status: 400 },
     );
   }
@@ -61,7 +72,21 @@ export async function POST(request: NextRequest) {
         { status: 400 },
       );
     }
-    const result = await teardown(source, target);
+    if (
+      body.releaseActiveSlot === true &&
+      body.confirmReleaseActiveSlot !== true
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            "Explicit confirmation is required before ending the active app-owned replication session.",
+        },
+        { status: 400 },
+      );
+    }
+    const result = await teardown(source, target, {
+      releaseActiveSlot: body.releaseActiveSlot === true,
+    });
     return NextResponse.json(result);
   } catch (e) {
     const { classifyError } = await import("@/lib/neon-error-codes");

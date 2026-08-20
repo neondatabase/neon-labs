@@ -11,13 +11,17 @@ async function connectionUriForProject(
   accessToken: string,
   projectId: string,
 ) {
-  try {
-    /* Do not cache database credentials in application memory. Resolve them
-       only for the request that needs them. */
-    return await resolveConnectionUri(accessToken, projectId);
-  } catch {
-    return null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      /* Do not cache database credentials in application memory. Resolve them
+         only for the request that needs them. */
+      return await resolveConnectionUri(accessToken, projectId);
+    } catch {
+      if (attempt === 2) return null;
+      await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+    }
   }
+  return null;
 }
 
 export interface ConnectionOverrides {
