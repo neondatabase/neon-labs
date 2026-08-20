@@ -135,7 +135,12 @@ export async function preflight(
   sourceConn: string,
   targetConn: string,
   requestedTables?: string[],
-): Promise<ReplicationPreflight> {
+): Promise<
+  Omit<
+    ReplicationPreflight,
+    "resources" | "recoveryRequired" | "resumeMonitoring"
+  >
+> {
   const selectedTables = await resolveTableSelection(
     sourceConn,
     requestedTables,
@@ -615,6 +620,34 @@ export async function setupReplication(
   const pubName = opts.publicationName ?? DEFAULT_PUB;
   const subName = opts.subscriptionName ?? DEFAULT_SUB;
   const startedAt = new Date().toISOString();
+  const existingResources = await inspectReplicationResources(
+    sourceConn,
+    targetConn,
+  );
+  if (existingResources.anyResourceExists) {
+    if (existingResources.subscription.state === "present") {
+      throw setupFailure(
+        "verification",
+        subName,
+        new Error(
+          `Subscription "${subName}" already exists. Resume monitoring instead of running setup again.`,
+        ),
+      );
+    }
+    const remainingResource =
+      existingResources.slot.state !== "absent"
+        ? `replication slot "${existingResources.slot.name ?? subName}"`
+        : `publication "${pubName}"`;
+    throw setupFailure(
+      existingResources.slot.state !== "absent"
+        ? "subscription-create"
+        : "publication-create",
+      existingResources.slot.name ?? pubName,
+      new Error(
+        `Setup blocked because ${remainingResource} remains from an earlier attempt. Complete setup recovery before retrying.`,
+      ),
+    );
+  }
   let selectedTables: ReplicationTableRef[] | null;
   try {
     selectedTables = await resolveTableSelection(sourceConn, opts.tables);

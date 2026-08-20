@@ -135,17 +135,17 @@ export default function ReplicationPage() {
       targetProjectId?: string;
       tables?: string[];
     } = {};
-    if (sourceOverride?.projectId) body.sourceProjectId = sourceOverride.projectId;
-    if (targetOverride?.projectId) body.targetProjectId = targetOverride.projectId;
+    if (sourceProjectId) body.sourceProjectId = sourceProjectId;
+    if (targetProjectId) body.targetProjectId = targetProjectId;
     if (includeTables && tableSelectionReady) {
       body.tables = selectedTables;
     }
     return body;
   }, [
     selectedTables,
-    sourceOverride,
+    sourceProjectId,
     tableSelectionReady,
-    targetOverride,
+    targetProjectId,
   ]);
 
   const resumeMonitoring = useCallback((existingStatus: ReplicationStatus) => {
@@ -201,6 +201,60 @@ export default function ReplicationPage() {
       setTeardownInspecting(false);
     }
   }, [targetBody]);
+
+  const executeTeardownRequest = useCallback(async () => {
+    setPhase("tearing-down");
+    setError(null);
+    try {
+      const response = await fetch("/api/neon/replication/teardown", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...targetBody(),
+          action: "execute",
+          confirm: true,
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        const apiError = body as {
+          error?: string;
+          classified?: ClassifiedError;
+        };
+        setClassifiedError(apiError.classified ?? null);
+        throw new Error(apiError.error ?? `Failed (${response.status})`);
+      }
+      setClassifiedError(null);
+      const result = body as ReplicationTeardownResult;
+      setTeardownResult(result);
+      setTeardownInspection(result.after);
+      if (result.cleanupComplete) {
+        setConfirmTeardown(false);
+        setSetup(null);
+        setStatus(null);
+        setResumedSession(false);
+        setCutoverPre(null);
+        setPhase(cutoverResult ? "cutover-complete" : "idle");
+      } else {
+        // Preserve confirmation for this recovery attempt so automatic
+        // rechecks can safely finish cleanup once the slot is inactive.
+        setPhase(
+          setup ? "monitoring" : cutoverResult ? "cutover-complete" : "idle",
+        );
+      }
+      return result;
+    } catch (teardownError) {
+      setError(
+        teardownError instanceof Error
+          ? teardownError.message
+          : "Teardown failed",
+      );
+      setPhase(
+        setup ? "monitoring" : cutoverResult ? "cutover-complete" : "idle",
+      );
+      return null;
+    }
+  }, [cutoverResult, setup, targetBody]);
 
   useEffect(() => {
     fetch("/api/neon/config")
@@ -275,15 +329,31 @@ export default function ReplicationPage() {
     const isActiveOrphan =
       teardownInspection?.subscription.state === "absent" &&
       teardownInspection.slot.state === "active";
-    if (!isActiveOrphan || teardownRecheckAttempts >= 5) return;
+    if (
+      !isActiveOrphan ||
+      teardownRecheckAttempts >= 10 ||
+      phase === "tearing-down"
+    ) {
+      return;
+    }
     const timeout = window.setTimeout(() => {
-      void inspectTeardown().finally(() =>
-        setTeardownRecheckAttempts((attempts) => attempts + 1),
-      );
-    }, 1500);
+      void inspectTeardown().then((inspection) => {
+        setTeardownRecheckAttempts((attempts) => attempts + 1);
+        if (
+          confirmTeardown &&
+          inspection?.subscription.state === "absent" &&
+          inspection.slot.state === "present"
+        ) {
+          void executeTeardownRequest();
+        }
+      });
+    }, 2000);
     return () => window.clearTimeout(timeout);
   }, [
+    confirmTeardown,
+    executeTeardownRequest,
     inspectTeardown,
+    phase,
     teardownInspection,
     teardownRecheckAttempts,
   ]);
@@ -325,10 +395,34 @@ export default function ReplicationPage() {
       const body = await res.json();
       if (!res.ok) throw new Error(handleApiError(body, `Failed (${res.status})`));
       setClassifiedError(null);
-      setPreflight(body);
+      const result = body as ReplicationPreflight;
+      setPreflight(result);
+      setTeardownInspection(result.resources);
+      if (!result.resources.anyResourceExists) {
+        setTeardownResult(null);
+        setConfirmTeardown(false);
+      }
       if (!tableSelectionReady) {
-        setSelectedTables(body.source.tables);
+        setSelectedTables(result.source.tables);
         setTableSelectionReady(true);
+      }
+      if (result.resumeMonitoring) {
+        const statusResponse = await fetch("/api/neon/replication/status", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(targetBody()),
+        });
+        if (statusResponse.ok) {
+          resumeMonitoring(
+            (await statusResponse.json()) as ReplicationStatus,
+          );
+          return;
+        }
+        setError(
+          "An existing subscription was found, but its status could not be loaded. Refresh before running setup again.",
+        );
+        setPhase("idle");
+        return;
       }
       setPhase("preflight-done");
     } catch (e) {
@@ -406,39 +500,8 @@ export default function ReplicationPage() {
 
   async function runTeardown() {
     if (!confirmTeardown) return;
-    setPhase("tearing-down");
-    setError(null);
-    try {
-      const res = await fetch("/api/neon/replication/teardown", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ...targetBody(),
-          action: "execute",
-          confirm: true,
-        }),
-      });
-      const body = await res.json();
-      if (!res.ok) throw new Error(handleApiError(body, `Failed (${res.status})`));
-      setClassifiedError(null);
-      const result = body as ReplicationTeardownResult;
-      setTeardownResult(result);
-      setTeardownInspection(result.after);
-      setTeardownRecheckAttempts(0);
-      setConfirmTeardown(false);
-      if (result.cleanupComplete) {
-        setSetup(null);
-        setStatus(null);
-        setResumedSession(false);
-        setCutoverPre(null);
-        setPhase(cutoverResult ? "cutover-complete" : "idle");
-      } else {
-        setPhase(setup ? "monitoring" : cutoverResult ? "cutover-complete" : "idle");
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Teardown failed");
-      setPhase(setup ? "monitoring" : cutoverResult ? "cutover-complete" : "idle");
-    }
+    setTeardownRecheckAttempts(0);
+    await executeTeardownRequest();
   }
 
   async function runCutoverPreflight() {
@@ -1279,9 +1342,27 @@ export default function ReplicationPage() {
         {(teardownInspection?.anyResourceExists || teardownResult) && (
           <div id="replication-teardown">
             <Section
-              eyebrow="Cleanup"
-              title="Replication teardown"
-              subtitle="Inspect and remove only the replication resources created by this application"
+              eyebrow={
+                !setup &&
+                !cutoverResult &&
+                teardownInspection?.subscription.state === "absent"
+                  ? "Recovery"
+                  : "Cleanup"
+              }
+              title={
+                !setup &&
+                !cutoverResult &&
+                teardownInspection?.subscription.state === "absent"
+                  ? "Setup recovery"
+                  : "Replication teardown"
+              }
+              subtitle={
+                !setup &&
+                !cutoverResult &&
+                teardownInspection?.subscription.state === "absent"
+                  ? "Remove partial resources from an earlier setup attempt before retrying"
+                  : "Inspect and remove only the replication resources created by this application"
+              }
               danger
               action={
                 <Button
@@ -1303,11 +1384,13 @@ export default function ReplicationPage() {
                   busy={phase === "tearing-down"}
                   checking={teardownInspecting}
                   recheckAttempts={teardownRecheckAttempts}
+                  setupRecovery={
+                    !setup &&
+                    !cutoverResult &&
+                    teardownInspection.subscription.state === "absent"
+                  }
                   onConfirmedChange={setConfirmTeardown}
-                  onCheckAgain={() => {
-                    setTeardownRecheckAttempts(0);
-                    void inspectTeardown();
-                  }}
+                  onRetryCleanup={runTeardown}
                   onTeardown={runTeardown}
                 />
               ) : null}
@@ -1927,8 +2010,9 @@ function TeardownPanel({
   busy,
   checking,
   recheckAttempts,
+  setupRecovery,
   onConfirmedChange,
-  onCheckAgain,
+  onRetryCleanup,
   onTeardown,
 }: {
   inspection: ReplicationResourceInspection;
@@ -1937,8 +2021,9 @@ function TeardownPanel({
   busy: boolean;
   checking: boolean;
   recheckAttempts: number;
+  setupRecovery: boolean;
   onConfirmedChange: (confirmed: boolean) => void;
-  onCheckAgain: () => void;
+  onRetryCleanup: () => void;
   onTeardown: () => void;
 }) {
   const stateColor = (state: string) =>
@@ -1964,14 +2049,17 @@ WHERE pid = ${inspection.slot.activePid};`
       <div className="rounded-[4px] border border-[#ef4444]/40 bg-[#ef4444]/[0.08] p-3">
         <p className="flex items-center gap-2 text-caption font-medium text-[#ef4444]">
           <AlertOctagon className="h-3.5 w-3.5" />
-          Teardown permanently stops replication and removes the
-          replication-based rollback path.
+          {setupRecovery
+            ? "Cleanup permanently removes the partial replication resources from this setup attempt."
+            : "Teardown permanently stops replication and removes the replication-based rollback path."}
         </p>
-        <p className="mt-2 text-label leading-[1.55] text-[#f3f4f6]">
-          Keep the source project, subscription, publication, and replication
-          slot for 24–48 hours after cutover when possible. Teardown only after
-          the target is stable and you no longer need source rollback.
-        </p>
+        {!setupRecovery ? (
+          <p className="mt-2 text-label leading-[1.55] text-[#f3f4f6]">
+            Keep the source project, subscription, publication, and replication
+            slot for 24–48 hours after cutover when possible. Teardown only
+            after the target is stable and you no longer need source rollback.
+          </p>
+        ) : null}
       </div>
 
       <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
@@ -2057,8 +2145,8 @@ WHERE pid = ${inspection.slot.activePid};`
           </p>
           <div className="flex flex-wrap items-center gap-3">
             <Button
-              disabled={checking}
-              onClick={onCheckAgain}
+              disabled={!confirmed || checking || busy}
+              onClick={onRetryCleanup}
               size="lg"
               variant="outline"
             >
@@ -2067,11 +2155,11 @@ WHERE pid = ${inspection.slot.activePid};`
               ) : (
                 <RefreshCw className="h-3.5 w-3.5" />
               )}
-              Check again
+              Retry cleanup
             </Button>
             <p className="text-label text-[#9ca3af]">
-              {recheckAttempts < 5
-                ? `Automatic recheck ${recheckAttempts + 1} of 5`
+              {recheckAttempts < 10
+                ? `Automatic recheck ${recheckAttempts + 1} of 10`
                 : "Automatic rechecks stopped after the timeout."}
             </p>
           </div>
@@ -2108,8 +2196,9 @@ WHERE pid = ${inspection.slot.activePid};`
               type="checkbox"
             />
             <span>
-              I understand that teardown permanently stops replication and
-              removes the replication-based rollback path.
+              {setupRecovery
+                ? "I understand that cleanup permanently removes these partial replication resources."
+                : "I understand that teardown permanently stops replication and removes the replication-based rollback path."}
             </span>
           </label>
           <Button
@@ -2126,7 +2215,9 @@ WHERE pid = ${inspection.slot.activePid};`
             ) : (
               <>
                 <Trash2 className="h-3.5 w-3.5" />
-                Permanently stop replication
+                {setupRecovery
+                  ? "Clean up setup resources"
+                  : "Permanently stop replication"}
               </>
             )}
           </Button>

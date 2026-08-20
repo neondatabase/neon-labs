@@ -3,7 +3,10 @@ import {
   MISSING_CONNECTIONS_ERROR,
   resolveConnections,
 } from "@/lib/neon-credentials";
-import { preflight } from "@/lib/neon-replication";
+import {
+  inspectReplicationResources,
+  preflight,
+} from "@/lib/neon-replication";
 
 export async function POST(request: NextRequest) {
   let body: {
@@ -36,8 +39,29 @@ export async function POST(request: NextRequest) {
     );
   }
   try {
-    const result = await preflight(source, target, body.tables);
-    return NextResponse.json(result);
+    const [result, resources] = await Promise.all([
+      preflight(source, target, body.tables),
+      inspectReplicationResources(source, target),
+    ]);
+    const resumeMonitoring = resources.subscription.state === "present";
+    const recoveryRequired =
+      !resumeMonitoring &&
+      (resources.publication.state !== "absent" ||
+        resources.slot.state !== "absent");
+    const blockers = recoveryRequired
+      ? [
+          ...result.blockers,
+          "Application-owned replication resources remain from an earlier setup attempt. Complete setup recovery before retrying.",
+        ]
+      : result.blockers;
+    return NextResponse.json({
+      ...result,
+      resources,
+      recoveryRequired,
+      resumeMonitoring,
+      ok: result.ok && !recoveryRequired && !resumeMonitoring,
+      blockers,
+    });
   } catch (e) {
     const { classifyError } = await import("@/lib/neon-error-codes");
     const classified = classifyError(e);

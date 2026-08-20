@@ -139,6 +139,9 @@ export interface ReplicationPreflight {
     schemaTableCount: number;
     existingSubscription: string | null;
   };
+  resources: ReplicationResourceInspection;
+  recoveryRequired: boolean;
+  resumeMonitoring: boolean;
   ok: boolean;
   blockers: string[];
   warnings: string[];
