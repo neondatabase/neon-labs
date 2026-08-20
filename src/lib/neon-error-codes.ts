@@ -89,6 +89,11 @@ export function attachSetupFailureContext(
   context: ReplicationSetupFailureContext,
 ): ClassifiedError {
   const partial = context.partialResources;
+  const duplicateSlot =
+    context.stage === "subscription-create" &&
+    /replication slot ["']?[^"'\s]+["']?\s+already exists/i.test(
+      classified.raw,
+    );
   const nextSteps: string[] = [];
   if (partial?.subscription.state === "present") {
     nextSteps.push(
@@ -99,7 +104,9 @@ export function attachSetupFailureContext(
     partial?.slot.state !== "absent"
   ) {
     nextSteps.push(
-      "Setup left replication resources behind. Review the exact resources in Replication teardown before retrying.",
+      duplicateSlot
+        ? "Partial source replication resources must be removed in Setup recovery before setup can retry."
+        : "Setup left replication resources behind. Review the exact resources in Setup recovery before retrying.",
     );
   } else if (context.retrySafe) {
     nextSteps.push(
@@ -122,7 +129,12 @@ export function attachSetupFailureContext(
 
   return {
     ...classified,
-    title: setupStageTitles[context.stage],
+    title: duplicateSlot
+      ? "Existing replication slot"
+      : setupStageTitles[context.stage],
+    explanation: duplicateSlot
+      ? "PostgreSQL could not create the subscription because its source replication slot already exists. Complete setup recovery before retrying."
+      : classified.explanation,
     stage: context.stage,
     resource: context.resource,
     retrySafe: context.retrySafe,
