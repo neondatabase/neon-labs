@@ -37,7 +37,7 @@ export default function RootLayout({
       lang="en"
       className={`${inter.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="flex h-screen overflow-hidden text-foreground">
+      <body className="flex h-dvh overflow-hidden text-foreground">
         <ToastProvider>
           <AssessmentProvider>
             <SetupGate>{children}</SetupGate>

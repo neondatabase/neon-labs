@@ -103,18 +103,24 @@ const columns: ColumnDef<NeonExtension, unknown>[] = [
       [extension.description, extension.comments].filter(Boolean).join(" "),
     header: "Notes",
     enableSorting: false,
-    cell: ({ row }) => (
-      <div className="max-w-md space-y-1 whitespace-normal text-caption">
-        <p className="text-muted-foreground">
-          {row.original.description ?? row.original.comments ?? "—"}
+    cell: ({ row }) => {
+      const notes = [
+        row.original.description,
+        row.original.comments !== row.original.description
+          ? row.original.comments
+          : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      return (
+        <p
+          className="min-w-56 max-w-80 truncate whitespace-nowrap text-caption text-muted-foreground"
+          title={notes || undefined}
+        >
+          {notes || "—"}
         </p>
-        {row.original.description &&
-          row.original.comments &&
-          row.original.comments !== row.original.description && (
-            <p className="text-[#fbbf24]">{row.original.comments}</p>
-          )}
-      </div>
-    ),
+      );
+    },
   },
 ];
 

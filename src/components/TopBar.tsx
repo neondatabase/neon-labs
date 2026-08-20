@@ -3,13 +3,14 @@
 import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import Link from "next/link";
-import { LogOut } from "lucide-react";
+import { Home, LogOut } from "lucide-react";
 import { initials } from "@/lib/initials";
 import {
   setSourceOverride,
   setTargetOverride,
 } from "@/lib/neon-settings";
 import { setSetupSkipped } from "@/lib/setup-status";
+import { SidebarTrigger } from "./ui/sidebar";
 
 const TITLES: Record<string, string> = {
   "/assess": "New assessment",
@@ -101,28 +102,35 @@ export function TopBar() {
 
   return (
     <header className="sticky top-0 z-10 flex h-[52px] items-center justify-between border-b border-[#262727] bg-[#0c0d0d]/80 px-6 backdrop-blur">
-      <nav className="flex items-center gap-2 text-ui">
-        <Link href="/" className="rounded-[2px] text-[#9ca3af] transition-colors duration-150 ease-out hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c0d0d]">
-          Neon Labs
-        </Link>
-        {section && (
-          <>
-            <span className="text-[#262727]">/</span>
-            <Link
-              href={section.href}
-              className="rounded-[2px] text-[#9ca3af] transition-colors duration-150 ease-out hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c0d0d]"
-            >
-              {section.label}
-            </Link>
-          </>
-        )}
+      <div className="flex min-w-0 items-center gap-2">
+        <SidebarTrigger className="-ml-2 md:hidden" />
+        <nav className="flex min-w-0 items-center gap-2 text-ui">
+          <Link
+            aria-label="Back to Neon Labs"
+            className="rounded-[2px] p-1 text-[#9ca3af] transition-colors duration-150 ease-out hover:bg-[#1a1b1b] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c0d0d]"
+            href="/"
+          >
+            <Home className="h-3.5 w-3.5" />
+          </Link>
+          {section && (
+            <>
+              <span className="text-[#262727]">/</span>
+              <Link
+                href={section.href}
+                className="truncate rounded-[2px] text-[#9ca3af] transition-colors duration-150 ease-out hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c0d0d]"
+              >
+                {section.label}
+              </Link>
+            </>
+          )}
         {title && (
           <>
-            <span className="text-[#262727]">/</span>
-            <span className="text-foreground">{title}</span>
+              {section ? <span className="text-[#262727]">/</span> : null}
+              <span className="truncate text-foreground">{title}</span>
           </>
         )}
-      </nav>
+        </nav>
+      </div>
 
       <div className="flex items-center gap-2">
         {authenticated && !developmentFallback && (

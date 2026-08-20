@@ -169,16 +169,22 @@ function Sidebar({
 
   if (isMobile) {
     return (
-      <Drawer.Root open={openMobile} onOpenChange={setOpenMobile}>
+      <Drawer.Root
+        open={openMobile}
+        onOpenChange={setOpenMobile}
+        swipeDirection="left"
+      >
         <Drawer.Portal>
-          <Drawer.Backdrop className="fixed inset-0 z-40 bg-black/60" />
-          <Drawer.Popup
-            data-slot="sidebar"
-            data-mobile="true"
-            className="fixed inset-y-0 left-0 z-50 flex w-(--sidebar-width) flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground"
-          >
-            {children}
-          </Drawer.Popup>
+          <Drawer.Backdrop className="fixed inset-0 z-40 h-dvh w-screen bg-black/60" />
+          <Drawer.Viewport className="pointer-events-none fixed inset-0 z-50 h-dvh w-screen overflow-hidden">
+            <Drawer.Popup
+              data-slot="sidebar"
+              data-mobile="true"
+              className="pointer-events-auto absolute inset-y-0 left-0 flex h-dvh w-(--sidebar-width) max-w-[calc(100vw-2rem)] flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground"
+            >
+              {children}
+            </Drawer.Popup>
+          </Drawer.Viewport>
         </Drawer.Portal>
       </Drawer.Root>
     );

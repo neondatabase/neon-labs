@@ -32,7 +32,7 @@ export function SetupGate({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <SidebarProvider className="min-h-0 flex-1">
+    <SidebarProvider className="h-full min-h-0 flex-1">
       <Sidebar />
       <SidebarInset className="bg-background">
         <TopBar />

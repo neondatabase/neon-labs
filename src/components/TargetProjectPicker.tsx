@@ -443,7 +443,14 @@ export function TargetProjectPicker({
 
         <PopoverContent
           align="start"
-          className="flex max-h-[min(430px,var(--available-height))] w-[420px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden p-0 shadow-2xl"
+          className="flex max-h-[min(430px,calc(100dvh-24px),var(--available-height))] w-[420px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden p-0 shadow-2xl"
+          collisionAvoidance={{
+            side: "shift",
+            align: "shift",
+            fallbackAxisSide: "none",
+          }}
+          collisionPadding={12}
+          positionMethod="fixed"
           side="bottom"
         >
           <div className="flex items-center gap-2 border-b border-border/60 px-3">
