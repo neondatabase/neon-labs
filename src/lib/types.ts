@@ -153,6 +153,19 @@ export interface ReplicationSetupResult {
   schemaCopied: boolean;
 }
 
+export type ReplicationSetupStage =
+  | "schema-copy"
+  | "publication-create"
+  | "subscription-create"
+  | "verification";
+
+export interface ReplicationSetupFailureContext {
+  stage: ReplicationSetupStage;
+  resource: string | null;
+  retrySafe: boolean;
+  partialResources: ReplicationResourceInspection | null;
+}
+
 export interface ReplicationStatus {
   subscriptionName: string;
   subscribed: boolean;
@@ -244,6 +257,7 @@ export interface ReplicationResourceInspection {
 export type ReplicationTeardownStepStatus =
   | "removed"
   | "already absent"
+  | "waiting"
   | "failed";
 
 export interface ReplicationTeardownStep {
@@ -263,6 +277,8 @@ export interface ReplicationTeardownStep {
 
 export interface ReplicationTeardownResult {
   ok: boolean;
+  replicationStopped: boolean;
+  cleanupComplete: boolean;
   before: ReplicationResourceInspection;
   after: ReplicationResourceInspection;
   steps: ReplicationTeardownStep[];

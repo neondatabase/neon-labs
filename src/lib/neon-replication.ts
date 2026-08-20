@@ -9,6 +9,7 @@ import type {
   ReplicationMonitor,
   ReplicationPreflight,
   ReplicationResourceInspection,
+  ReplicationSetupStage,
   ReplicationSetupResult,
   ReplicationStatus,
   ReplicationTeardownResult,
@@ -16,11 +17,53 @@ import type {
   SubscriberMonitorRow,
   TableReplicationState,
 } from "./types";
+import { sanitizeDatabaseError } from "./neon-error-codes";
 
 export const ADVISOR_PUBLICATION = "neon_advisor_pub" as const;
 export const ADVISOR_SUBSCRIPTION = "neon_advisor_sub" as const;
 const DEFAULT_PUB = ADVISOR_PUBLICATION;
 const DEFAULT_SUB = ADVISOR_SUBSCRIPTION;
+
+interface PostgresErrorLike {
+  code?: string;
+  message?: string;
+}
+
+export class ReplicationSetupError extends Error {
+  readonly stage: ReplicationSetupStage;
+  readonly resource: string | null;
+  readonly code?: string;
+
+  constructor(
+    stage: ReplicationSetupStage,
+    resource: string | null,
+    error: unknown,
+  ) {
+    const postgresError =
+      error && typeof error === "object"
+        ? (error as PostgresErrorLike)
+        : { message: String(error) };
+    super(
+      sanitizeDatabaseError(
+        postgresError.message || "Unknown database error",
+      ),
+    );
+    this.name = "ReplicationSetupError";
+    this.stage = stage;
+    this.resource = resource;
+    this.code = postgresError.code;
+  }
+}
+
+function setupFailure(
+  stage: ReplicationSetupStage,
+  resource: string | null,
+  error: unknown,
+): ReplicationSetupError {
+  return error instanceof ReplicationSetupError
+    ? error
+    : new ReplicationSetupError(stage, resource, error);
+}
 
 interface ReplicationTableRef {
   schema: string;
@@ -266,10 +309,10 @@ export async function preflight(
 
 interface SchemaCopyReport {
   extensionsCreated: string[];
-  extensionsFailed: { name: string; error: string }[];
+  extensionsFailed: { name: string; error: string; code?: string }[];
   tablesCreated: string[];
   tablesSkipped: string[];
-  tablesFailed: { name: string; error: string; ddl: string }[];
+  tablesFailed: { name: string; error: string; ddl: string; code?: string }[];
   indexesCreated: number;
   indexesFailed: { name: string; error: string }[];
 }
@@ -332,6 +375,10 @@ async function copySchemaIfNeeded(
           name: `${schema} (schema)`,
           error: err instanceof Error ? err.message : String(err),
           ddl: `CREATE SCHEMA IF NOT EXISTS "${schema}"`,
+          code:
+            err && typeof err === "object"
+              ? (err as PostgresErrorLike).code
+              : undefined,
         });
       }
     }
@@ -348,6 +395,10 @@ async function copySchemaIfNeeded(
         report.extensionsFailed.push({
           name: e.extname,
           error: err instanceof Error ? err.message : String(err),
+          code:
+            err && typeof err === "object"
+              ? (err as PostgresErrorLike).code
+              : undefined,
         });
       }
     }
@@ -409,6 +460,10 @@ async function copySchemaIfNeeded(
           name: `${s.schema}.${s.seq} (sequence)`,
           error: err instanceof Error ? err.message : String(err),
           ddl: `CREATE SEQUENCE "${s.schema}"."${s.seq}"`,
+          code:
+            err && typeof err === "object"
+              ? (err as PostgresErrorLike).code
+              : undefined,
         });
       }
     }
@@ -494,6 +549,10 @@ async function copySchemaIfNeeded(
           name: `${t.schema}.${t.table}`,
           error: err instanceof Error ? err.message : String(err),
           ddl,
+          code:
+            err && typeof err === "object"
+              ? (err as PostgresErrorLike).code
+              : undefined,
         });
       }
     }
@@ -556,87 +615,136 @@ export async function setupReplication(
   const pubName = opts.publicationName ?? DEFAULT_PUB;
   const subName = opts.subscriptionName ?? DEFAULT_SUB;
   const startedAt = new Date().toISOString();
-  const selectedTables = await resolveTableSelection(sourceConn, opts.tables);
+  let selectedTables: ReplicationTableRef[] | null;
+  try {
+    selectedTables = await resolveTableSelection(sourceConn, opts.tables);
+  } catch (error) {
+    throw setupFailure("verification", opts.tables?.[0] ?? null, error);
+  }
 
-  const schemaReport = await copySchemaIfNeeded(
-    sourceConn,
-    targetConn,
-    selectedTables,
-  );
+  let schemaReport: SchemaCopyReport;
+  try {
+    schemaReport = await copySchemaIfNeeded(
+      sourceConn,
+      targetConn,
+      selectedTables,
+    );
+  } catch (error) {
+    throw setupFailure("schema-copy", null, error);
+  }
+  if (schemaReport.extensionsFailed.length > 0) {
+    const firstFailure = schemaReport.extensionsFailed[0];
+    throw setupFailure("schema-copy", firstFailure.name, {
+      message: `Extension copy failed for ${firstFailure.name}. ${firstFailure.error}`,
+      code: firstFailure.code,
+    });
+  }
   if (schemaReport.tablesFailed.length > 0) {
-    throw new Error(
-      `Schema copy failed for ${schemaReport.tablesFailed.length} table(s). First failure: ${schemaReport.tablesFailed[0].name}, ${schemaReport.tablesFailed[0].error}`,
+    const firstFailure = schemaReport.tablesFailed[0];
+    throw setupFailure(
+      "schema-copy",
+      firstFailure.name,
+      {
+        message: `Schema copy failed for ${schemaReport.tablesFailed.length} table(s). ${firstFailure.error}`,
+        code: firstFailure.code,
+      },
     );
   }
 
-  const src = new Client({ connectionString: unpool(sourceConn) });
-  await src.connect();
   let tables: string[] = [];
   try {
-    const existing = await src.query<{ pubname: string }>(
-      "SELECT pubname FROM pg_publication WHERE pubname = $1",
-      [pubName],
-    );
-    if (existing.rows.length === 0) {
+    const src = new Client({ connectionString: unpool(sourceConn) });
+    await src.connect();
+    try {
+      const existing = await src.query<{ pubname: string }>(
+        "SELECT pubname FROM pg_publication WHERE pubname = $1",
+        [pubName],
+      );
+      if (existing.rows.length === 0) {
+        if (selectedTables) {
+          const tableList = selectedTables
+            .map(
+              (table) =>
+                `${quoteIdent(table.schema)}.${quoteIdent(table.table)}`,
+            )
+            .join(", ");
+          await src.query(
+            `CREATE PUBLICATION ${quoteIdent(pubName)} FOR TABLE ${tableList}`,
+          );
+        } else {
+          await src.query(
+            `CREATE PUBLICATION ${quoteIdent(pubName)} FOR ALL TABLES`,
+          );
+        }
+      }
+      const publishedTables = await src.query<{
+        schema: string;
+        table: string;
+      }>(
+        `SELECT schemaname AS schema, tablename AS table
+         FROM pg_publication_tables
+         WHERE pubname = $1
+         ORDER BY 1, 2`,
+        [pubName],
+      );
+      tables = publishedTables.rows.map(tableName);
       if (selectedTables) {
-        const tableList = selectedTables
-          .map(
-            (table) =>
-              `${quoteIdent(table.schema)}.${quoteIdent(table.table)}`,
-          )
-          .join(", ");
-        await src.query(
-          `CREATE PUBLICATION ${quoteIdent(pubName)} FOR TABLE ${tableList}`,
-        );
-      } else {
-        await src.query(
-          `CREATE PUBLICATION ${quoteIdent(pubName)} FOR ALL TABLES`,
-        );
+        const expected = [...selectedTables]
+          .map((table) => table.qualifiedName)
+          .sort();
+        const actual = [...tables].sort();
+        if (
+          expected.length !== actual.length ||
+          expected.some((table, index) => table !== actual[index])
+        ) {
+          throw new Error(
+            `Publication '${pubName}' already exists with a different table selection. Tear it down before starting a different selection.`,
+          );
+        }
       }
+    } finally {
+      await src.end().catch(() => undefined);
     }
-    const t = await src.query<{ schema: string; table: string }>(
-      `SELECT schemaname AS schema, tablename AS table
-       FROM pg_publication_tables
-       WHERE pubname = $1
-       ORDER BY 1, 2`,
-      [pubName],
-    );
-    tables = t.rows.map(tableName);
-    if (selectedTables) {
-      const expected = [...selectedTables]
-        .map((table) => table.qualifiedName)
-        .sort();
-      const actual = [...tables].sort();
-      if (
-        expected.length !== actual.length ||
-        expected.some((table, index) => table !== actual[index])
-      ) {
-        throw new Error(
-          `Publication '${pubName}' already exists with a different table selection. Tear it down before starting a different selection.`,
-        );
-      }
-    }
-  } finally {
-    await src.end();
+  } catch (error) {
+    throw setupFailure("publication-create", pubName, error);
   }
 
-  const tgt = new Client({ connectionString: unpool(targetConn) });
-  await tgt.connect();
   try {
-    const existingSub = await tgt.query(
-      "SELECT 1 FROM pg_subscription WHERE subname = $1",
-      [subName],
-    );
-    if (existingSub.rows.length === 0) {
-      // pg.Client doesn't allow parameterized DDL; the connection string is
-      // resolved server-side for the authenticated user's selected project.
-      const cleanConn = unpool(sourceConn).replace(/'/g, "''");
-      await tgt.query(
-        `CREATE SUBSCRIPTION ${quoteIdent(subName)} CONNECTION '${cleanConn}' PUBLICATION ${quoteIdent(pubName)} WITH (copy_data = true)`,
+    const tgt = new Client({ connectionString: unpool(targetConn) });
+    await tgt.connect();
+    try {
+      const existingSub = await tgt.query(
+        "SELECT 1 FROM pg_subscription WHERE subname = $1",
+        [subName],
+      );
+      if (existingSub.rows.length === 0) {
+        // pg.Client doesn't allow parameterized DDL; the connection string is
+        // resolved server-side for the authenticated user's selected project.
+        const cleanConn = unpool(sourceConn).replace(/'/g, "''");
+        await tgt.query(
+          `CREATE SUBSCRIPTION ${quoteIdent(subName)} CONNECTION '${cleanConn}' PUBLICATION ${quoteIdent(pubName)} WITH (copy_data = true)`,
+        );
+      }
+    } finally {
+      await tgt.end().catch(() => undefined);
+    }
+  } catch (error) {
+    throw setupFailure("subscription-create", subName, error);
+  }
+
+  try {
+    const resources = await inspectReplicationResources(sourceConn, targetConn);
+    if (
+      resources.subscription.state !== "present" ||
+      resources.publication.state !== "present" ||
+      resources.slot.state === "absent"
+    ) {
+      throw new Error(
+        `Setup verification found subscription=${resources.subscription.state}, publication=${resources.publication.state}, slot=${resources.slot.state}.`,
       );
     }
-  } finally {
-    await tgt.end();
+  } catch (error) {
+    throw setupFailure("verification", subName, error);
   }
 
   return {
@@ -1236,22 +1344,21 @@ export async function teardown(
           detail: "The source replication slot is already absent.",
         });
       } else if (slot.rows[0].active) {
-        steps.push(
-          failedStep(
-            "confirm-slot-inactive",
-            "Confirm source slot is inactive",
-            recordedSlotName,
-            `The slot is still active${slot.rows[0].active_pid ? ` on PID ${slot.rows[0].active_pid}` : ""}; it was not force-dropped.`,
-          ),
-        );
-        steps.push(
-          failedStep(
-            "drop-slot",
-            "Drop source replication slot",
-            recordedSlotName,
-            "Not attempted because PostgreSQL reports the slot as active.",
-          ),
-        );
+        steps.push({
+          id: "confirm-slot-inactive",
+          label: "Confirm source slot is inactive",
+          resource: recordedSlotName,
+          status: "waiting",
+          detail: `PostgreSQL still reports the slot as active${slot.rows[0].active_pid ? ` on PID ${slot.rows[0].active_pid}` : ""}. Automatic checks timed out without terminating the backend.`,
+        });
+        steps.push({
+          id: "drop-slot",
+          label: "Drop source replication slot",
+          resource: recordedSlotName,
+          status: "waiting",
+          detail:
+            "Waiting for PostgreSQL to report the slot inactive. An active slot is never force-dropped.",
+        });
       } else {
         steps.push({
           id: "confirm-slot-inactive",
@@ -1294,14 +1401,16 @@ export async function teardown(
         detail: "The source publication is already absent.",
       });
     } else if (!targetClean || !slotClean) {
-      steps.push(
-        failedStep(
-          "drop-publication",
-          "Drop source publication",
-          ADVISOR_PUBLICATION,
+      steps.push({
+        id: "drop-publication",
+        label: "Drop source publication",
+        resource: ADVISOR_PUBLICATION,
+        status: steps.some((step) => step.status === "failed")
+          ? "failed"
+          : "waiting",
+        detail:
           "Not attempted until the subscription and replication slot are removed.",
-        ),
-      );
+      });
     } else {
       try {
         await src.query(`DROP PUBLICATION "${ADVISOR_PUBLICATION}"`);
@@ -1346,18 +1455,20 @@ export async function teardown(
       ? `publication ${ADVISOR_PUBLICATION}`
       : null,
   ].filter((resource): resource is string => resource !== null);
-  const ok = remainingResources.length === 0;
+  const replicationStopped = after.subscription.state === "absent";
+  const cleanupComplete = remainingResources.length === 0;
+  const waiting = steps.some((step) => step.status === "waiting");
   steps.push({
     id: "verify-removal",
     label: "Verify resource removal",
     resource: "all application-owned replication resources",
-    status: ok ? "removed" : "failed",
-    detail: ok
+    status: cleanupComplete ? "removed" : waiting ? "waiting" : "failed",
+    detail: cleanupComplete
       ? "Subscription, replication slot, and publication are absent."
       : `Still present: ${remainingResources.join(", ")}.`,
   });
 
-  const recoveryInstructions = ok
+  const recoveryInstructions = cleanupComplete
     ? []
     : [
         "Keep the source project available and retry teardown after resolving the failed step.",
@@ -1366,7 +1477,8 @@ export async function teardown(
           : []),
         ...(after.slot.state === "active"
           ? [
-              `Wait for replication slot ${after.slot.name} to become inactive; this tool will never force-drop an active slot.`,
+              `The target subscription is ${after.subscription.state}. Wait for replication slot ${after.slot.name} to become inactive${after.slot.activePid ? ` after backend PID ${after.slot.activePid} exits` : ""}; this tool will never terminate the backend or force-drop an active slot.`,
+              `On the source, inspect SELECT slot_name, active, active_pid FROM pg_replication_slots WHERE slot_name = '${after.slot.name}'; and inspect the reported PID in pg_stat_activity.`,
             ]
           : after.slot.state === "present"
             ? [`Retry removal of inactive replication slot ${after.slot.name}.`]
@@ -1378,5 +1490,14 @@ export async function teardown(
           : []),
       ];
 
-  return { ok, before, after, steps, remainingResources, recoveryInstructions };
+  return {
+    ok: cleanupComplete,
+    replicationStopped,
+    cleanupComplete,
+    before,
+    after,
+    steps,
+    remainingResources,
+    recoveryInstructions,
+  };
 }

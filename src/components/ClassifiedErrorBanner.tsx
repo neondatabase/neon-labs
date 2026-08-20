@@ -53,8 +53,50 @@ export function ClassifiedErrorBanner({
           <p className={`mt-1 text-caption ${neon.muted}`}>
             {classified.explanation}
           </p>
+          {classified.resource ? (
+            <p className="mt-2 text-caption text-[#f3f4f6]">
+              Affected resource:{" "}
+              <span className="font-mono">{classified.resource}</span>
+            </p>
+          ) : null}
         </div>
       </div>
+
+      <div className="mb-3 rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
+        <p className="tag mb-2">Database error</p>
+        <p className="whitespace-pre-wrap break-words text-caption text-[#f3f4f6]">
+          {classified.raw}
+        </p>
+      </div>
+
+      {classified.partialResources ? (
+        <div className="mb-3 rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
+          <p className="tag mb-2">Detected replication resources</p>
+          <div className="space-y-1 text-caption text-[#f3f4f6]">
+            <p>
+              Subscription{" "}
+              <span className="font-mono">
+                {classified.partialResources.subscription.name}
+              </span>
+              : {classified.partialResources.subscription.state}
+            </p>
+            <p>
+              Slot{" "}
+              <span className="font-mono">
+                {classified.partialResources.slot.name ?? "—"}
+              </span>
+              : {classified.partialResources.slot.state}
+            </p>
+            <p>
+              Publication{" "}
+              <span className="font-mono">
+                {classified.partialResources.publication.name}
+              </span>
+              : {classified.partialResources.publication.state}
+            </p>
+          </div>
+        </div>
+      ) : null}
 
       {/* Next steps */}
       <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
@@ -108,15 +150,6 @@ export function ClassifiedErrorBanner({
         </div>
       )}
 
-      {/* Raw message, collapsible */}
-      <details className="mt-3">
-        <summary className="cursor-pointer text-label text-[#9ca3af] hover:text-foreground">
-          Show raw error
-        </summary>
-        <pre className="mt-2 overflow-x-auto rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-2 font-mono text-micro text-[#f3f4f6]">
-          {classified.raw}
-        </pre>
-      </details>
     </div>
   );
 }

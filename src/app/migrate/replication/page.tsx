@@ -111,6 +111,8 @@ export default function ReplicationPage() {
   const [teardownResult, setTeardownResult] =
     useState<ReplicationTeardownResult | null>(null);
   const [confirmTeardown, setConfirmTeardown] = useState(false);
+  const [teardownInspecting, setTeardownInspecting] = useState(false);
+  const [teardownRecheckAttempts, setTeardownRecheckAttempts] = useState(0);
   const recoveryChecks = useRef(new Set<string>());
 
   useEffect(() => {
@@ -146,6 +148,23 @@ export default function ReplicationPage() {
     targetOverride,
   ]);
 
+  const resumeMonitoring = useCallback((existingStatus: ReplicationStatus) => {
+    const tables = existingStatus.perTable.map((table) => table.table);
+    setStatus(existingStatus);
+    setSetup({
+      publicationName: "neon_advisor_pub",
+      subscriptionName: existingStatus.subscriptionName,
+      tables,
+      startedAt: "",
+      walLevelChanged: false,
+      schemaCopied: true,
+    });
+    setSelectedTables(tables);
+    setTableSelectionReady(true);
+    setResumedSession(true);
+    setPhase("monitoring");
+  }, []);
+
   /** Extract structured error from a response body and surface both
       raw + classified state. Returns the message to throw for normal flow. */
   function handleApiError(body: unknown, fallback: string): string {
@@ -156,7 +175,8 @@ export default function ReplicationPage() {
     return raw;
   }
 
-  const inspectTeardown = useCallback(async () => {
+  const inspectTeardown = useCallback(async (): Promise<ReplicationResourceInspection | null> => {
+    setTeardownInspecting(true);
     try {
       const response = await fetch("/api/neon/replication/teardown", {
         method: "POST",
@@ -167,13 +187,18 @@ export default function ReplicationPage() {
       if (!response.ok) {
         throw new Error(body?.error ?? "Replication resource inspection failed");
       }
-      setTeardownInspection(body as ReplicationResourceInspection);
+      const inspection = body as ReplicationResourceInspection;
+      setTeardownInspection(inspection);
+      return inspection;
     } catch (inspectionError) {
       setError(
         inspectionError instanceof Error
           ? inspectionError.message
           : "Replication resource inspection failed",
       );
+      return null;
+    } finally {
+      setTeardownInspecting(false);
     }
   }, [targetBody]);
 
@@ -227,20 +252,7 @@ export default function ReplicationPage() {
       })
       .then((existingStatus) => {
         if (cancelled || !existingStatus?.subscribed) return;
-        const tables = existingStatus.perTable.map((table) => table.table);
-        setStatus(existingStatus);
-        setSetup({
-          publicationName: "neon_advisor_pub",
-          subscriptionName: existingStatus.subscriptionName,
-          tables,
-          startedAt: "",
-          walLevelChanged: false,
-          schemaCopied: true,
-        });
-        setSelectedTables(tables);
-        setTableSelectionReady(true);
-        setResumedSession(true);
-        setPhase("monitoring");
+        resumeMonitoring(existingStatus);
       })
       .catch(() => undefined);
 
@@ -250,12 +262,30 @@ export default function ReplicationPage() {
   }, [
     cfg?.authenticated,
     phase,
+    resumeMonitoring,
     setup,
     sourceProjectId,
     sourceOverride,
     targetBody,
     targetProjectId,
     targetOverride,
+  ]);
+
+  useEffect(() => {
+    const isActiveOrphan =
+      teardownInspection?.subscription.state === "absent" &&
+      teardownInspection.slot.state === "active";
+    if (!isActiveOrphan || teardownRecheckAttempts >= 5) return;
+    const timeout = window.setTimeout(() => {
+      void inspectTeardown().finally(() =>
+        setTeardownRecheckAttempts((attempts) => attempts + 1),
+      );
+    }, 1500);
+    return () => window.clearTimeout(timeout);
+  }, [
+    inspectTeardown,
+    teardownInspection,
+    teardownRecheckAttempts,
   ]);
 
   // Auto-poll status during monitoring phase
@@ -354,7 +384,23 @@ export default function ReplicationPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Setup failed");
       setPhase("preflight-done");
-      await inspectTeardown();
+      const inspection = await inspectTeardown();
+      if (inspection?.subscription.state === "present") {
+        try {
+          const statusResponse = await fetch("/api/neon/replication/status", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(targetBody()),
+          });
+          if (statusResponse.ok) {
+            resumeMonitoring(
+              (await statusResponse.json()) as ReplicationStatus,
+            );
+          }
+        } catch {
+          // Keep the structured setup error and inspected resource state visible.
+        }
+      }
     }
   }
 
@@ -378,8 +424,9 @@ export default function ReplicationPage() {
       const result = body as ReplicationTeardownResult;
       setTeardownResult(result);
       setTeardownInspection(result.after);
+      setTeardownRecheckAttempts(0);
       setConfirmTeardown(false);
-      if (result.ok) {
+      if (result.cleanupComplete) {
         setSetup(null);
         setStatus(null);
         setResumedSession(false);
@@ -1237,7 +1284,12 @@ export default function ReplicationPage() {
               subtitle="Inspect and remove only the replication resources created by this application"
               danger
               action={
-                <Button size="lg" variant="ghost" onClick={inspectTeardown}>
+                <Button
+                  disabled={teardownInspecting}
+                  size="lg"
+                  variant="ghost"
+                  onClick={() => void inspectTeardown()}
+                >
                   <RefreshCw className="h-3.5 w-3.5" />
                   Refresh resources
                 </Button>
@@ -1249,7 +1301,13 @@ export default function ReplicationPage() {
                   result={teardownResult}
                   confirmed={confirmTeardown}
                   busy={phase === "tearing-down"}
+                  checking={teardownInspecting}
+                  recheckAttempts={teardownRecheckAttempts}
                   onConfirmedChange={setConfirmTeardown}
+                  onCheckAgain={() => {
+                    setTeardownRecheckAttempts(0);
+                    void inspectTeardown();
+                  }}
                   onTeardown={runTeardown}
                 />
               ) : null}
@@ -1867,14 +1925,20 @@ function TeardownPanel({
   result,
   confirmed,
   busy,
+  checking,
+  recheckAttempts,
   onConfirmedChange,
+  onCheckAgain,
   onTeardown,
 }: {
   inspection: ReplicationResourceInspection;
   result: ReplicationTeardownResult | null;
   confirmed: boolean;
   busy: boolean;
+  checking: boolean;
+  recheckAttempts: number;
   onConfirmedChange: (confirmed: boolean) => void;
+  onCheckAgain: () => void;
   onTeardown: () => void;
 }) {
   const stateColor = (state: string) =>
@@ -1883,6 +1947,17 @@ function TeardownPanel({
       : state === "active"
         ? "text-[#ef4444]"
         : "text-[#f59e0b]";
+  const activeOrphan =
+    inspection.subscription.state === "absent" &&
+    inspection.slot.state === "active";
+  const slotInspectionSql = `SELECT slot_name, active, active_pid
+FROM pg_replication_slots
+WHERE slot_name = 'neon_advisor_sub';`;
+  const backendInspectionSql = inspection.slot.activePid
+    ? `SELECT pid, backend_type, application_name, state, wait_event_type, wait_event
+FROM pg_stat_activity
+WHERE pid = ${inspection.slot.activePid};`
+    : null;
 
   return (
     <div className="space-y-4">
@@ -1957,11 +2032,69 @@ function TeardownPanel({
         </dl>
       </div>
 
-      {inspection.slot.state === "active" ? (
+      {activeOrphan ? (
+        <div className="space-y-3 rounded-[4px] border border-[#f59e0b]/40 bg-[#f59e0b]/[0.08] p-3">
+          <div>
+            <p className="text-caption font-medium text-[#00e599]">
+              Replication subscription removed
+            </p>
+            <p className="mt-1 text-caption font-medium text-[#f59e0b]">
+              Source cleanup is incomplete
+            </p>
+          </div>
+          <p className="text-label leading-[1.55] text-[#f3f4f6]">
+            The target subscription is already absent. PostgreSQL still reports
+            the source replication slot as active
+            {inspection.slot.activePid ? (
+              <>
+                {" "}
+                on PID{" "}
+                <span className="font-mono">{inspection.slot.activePid}</span>
+              </>
+            ) : null}
+            . Waiting for that backend to exit before removing the slot and
+            publication.
+          </p>
+          <div className="flex flex-wrap items-center gap-3">
+            <Button
+              disabled={checking}
+              onClick={onCheckAgain}
+              size="lg"
+              variant="outline"
+            >
+              {checking ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="h-3.5 w-3.5" />
+              )}
+              Check again
+            </Button>
+            <p className="text-label text-[#9ca3af]">
+              {recheckAttempts < 5
+                ? `Automatic recheck ${recheckAttempts + 1} of 5`
+                : "Automatic rechecks stopped after the timeout."}
+            </p>
+          </div>
+          <div>
+            <p className="tag mb-1">Read-only source inspection</p>
+            <pre className="overflow-x-auto rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-2 font-mono text-micro text-[#f3f4f6]">
+              {slotInspectionSql}
+              {backendInspectionSql ? `\n\n${backendInspectionSql}` : ""}
+            </pre>
+          </div>
+          <p className="text-label leading-[1.55] text-[#f3f4f6]">
+            If the PID remains after the target subscription is absent, inspect
+            the backend and end the owning client or session manually. This
+            advisor will not call{" "}
+            <span className="font-mono">pg_terminate_backend</span> or force-drop
+            an active slot. Run teardown again after the slot becomes inactive.
+          </p>
+        </div>
+      ) : inspection.slot.state === "active" ? (
         <div className="rounded-[4px] border border-[#f59e0b]/40 bg-[#f59e0b]/[0.08] px-3 py-2 text-caption text-[#f59e0b]">
-          The replication slot is active. This tool will not terminate its
-          process or force-drop it. Disable and remove the subscription, then
-          retry after PostgreSQL reports the slot inactive.
+          PostgreSQL reports this slot active. Teardown will first disable and
+          remove the existing subscription, then wait briefly for its backend
+          to exit. It will never terminate the process or force-drop the slot.
         </div>
       ) : null}
 
@@ -2004,14 +2137,18 @@ function TeardownPanel({
         <div className="space-y-3">
           <div
             className={`rounded-[4px] border px-3 py-2 text-caption ${
-              result.ok
+              result.cleanupComplete
                 ? "border-[#00e599]/40 bg-[#00e599]/[0.08] text-[#00e599]"
-                : "border-[#ef4444]/40 bg-[#ef4444]/[0.08] text-[#ef4444]"
+                : result.replicationStopped
+                  ? "border-[#f59e0b]/40 bg-[#f59e0b]/[0.08] text-[#f59e0b]"
+                  : "border-[#ef4444]/40 bg-[#ef4444]/[0.08] text-[#ef4444]"
             }`}
           >
-            {result.ok
+            {result.cleanupComplete
               ? "Teardown verified. No application-owned replication resources remain."
-              : `Teardown is incomplete. Remaining resources: ${result.remainingResources.join(", ")}.`}
+              : result.replicationStopped
+                ? `Replication subscription removed. Source cleanup is incomplete. Remaining resources: ${result.remainingResources.join(", ")}.`
+                : `Replication is not stopped. Remaining resources: ${result.remainingResources.join(", ")}.`}
           </div>
           <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
             <p className="mb-2 text-micro uppercase tracking-[0.08em] text-[#9ca3af]">
@@ -2034,6 +2171,8 @@ function TeardownPanel({
                     className={
                       step.status === "failed"
                         ? "text-[#ef4444]"
+                        : step.status === "waiting"
+                          ? "text-[#f59e0b]"
                         : step.status === "removed"
                           ? "text-[#00e599]"
                           : "text-[#9ca3af]"

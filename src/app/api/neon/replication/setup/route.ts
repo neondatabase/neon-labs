@@ -3,8 +3,15 @@ import {
   MISSING_CONNECTIONS_ERROR,
   resolveConnections,
 } from "@/lib/neon-credentials";
-import { setupReplication } from "@/lib/neon-replication";
-import { classifyError } from "@/lib/neon-error-codes";
+import {
+  inspectReplicationResources,
+  ReplicationSetupError,
+  setupReplication,
+} from "@/lib/neon-replication";
+import {
+  attachSetupFailureContext,
+  classifyError,
+} from "@/lib/neon-error-codes";
 
 export async function POST(request: NextRequest) {
   let body: {
@@ -42,11 +49,27 @@ export async function POST(request: NextRequest) {
     });
     return NextResponse.json(result);
   } catch (e) {
-    const classified = classifyError(e);
+    const setupError =
+      e instanceof ReplicationSetupError
+        ? e
+        : new ReplicationSetupError("verification", null, e);
+    const partialResources = await inspectReplicationResources(source, target)
+      .catch(() => null);
+    const setupFailure = {
+      stage: setupError.stage,
+      resource: setupError.resource,
+      retrySafe: partialResources?.anyResourceExists === false,
+      partialResources,
+    };
+    const classified = attachSetupFailureContext(
+      classifyError(setupError),
+      setupFailure,
+    );
     return NextResponse.json(
       {
         error: classified.raw,
         classified,
+        setupFailure,
       },
       { status: 502 },
     );

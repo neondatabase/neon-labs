@@ -9,6 +9,11 @@
      - Generic Error objects from elsewhere in the stack
    ────────────────────────────────────────────────────────────── */
 
+import type {
+  ReplicationSetupFailureContext,
+  ReplicationSetupStage,
+} from "./types";
+
 export type RecoveryActionId =
   | "drop-orphan-slot"
   | "drop-orphan-subscription"
@@ -41,11 +46,17 @@ export interface ClassifiedError {
   severity: "warning" | "error" | "fatal";
   /** Detected SQLSTATE if available */
   code?: string;
+  stage?: ReplicationSetupStage;
+  resource?: string | null;
+  retrySafe?: boolean;
+  partialResources?: ReplicationSetupFailureContext["partialResources"];
 }
 
 interface ErrorLike {
   message?: string;
   code?: string;
+  stage?: ReplicationSetupStage;
+  resource?: string | null;
 }
 
 function asErrorLike(e: unknown): ErrorLike {
@@ -53,11 +64,97 @@ function asErrorLike(e: unknown): ErrorLike {
   return { message: String(e) };
 }
 
+export function sanitizeDatabaseError(message: string): string {
+  return message
+    .replace(
+      /\b(postgres(?:ql)?:\/\/)([^@\s'"]+)@/gi,
+      "$1[credentials-redacted]@",
+    )
+    .replace(/\bpassword\s*=\s*('[^']*'|"[^"]*"|[^\s]+)/gi, "password=[redacted]")
+    .replace(
+      /\bCONNECTION\s+('[^']*'|"[^"]*")/gi,
+      "CONNECTION [redacted]",
+    );
+}
+
+const setupStageTitles: Record<ReplicationSetupStage, string> = {
+  "schema-copy": "Schema copy failed",
+  "publication-create": "Publication creation failed",
+  "subscription-create": "Subscription creation failed",
+  verification: "Replication setup verification failed",
+};
+
+export function attachSetupFailureContext(
+  classified: ClassifiedError,
+  context: ReplicationSetupFailureContext,
+): ClassifiedError {
+  const partial = context.partialResources;
+  const nextSteps: string[] = [];
+  if (partial?.subscription.state === "present") {
+    nextSteps.push(
+      "An existing target subscription was detected. Refresh the page to resume monitoring; do not run setup again.",
+    );
+  } else if (
+    partial?.publication.state !== "absent" ||
+    partial?.slot.state !== "absent"
+  ) {
+    nextSteps.push(
+      "Setup left replication resources behind. Review the exact resources in Replication teardown before retrying.",
+    );
+  } else if (context.retrySafe) {
+    nextSteps.push(
+      "No application-owned replication resources remain. Correct the error, then retry setup.",
+    );
+  } else {
+    nextSteps.push(
+      "Resource inspection could not prove that retrying is safe. Refresh and inspect replication resources before retrying.",
+    );
+  }
+  nextSteps.push(
+    context.stage === "schema-copy"
+      ? "Resolve the missing table, type, function, extension, or default-expression dependency named by the database error."
+      : context.stage === "publication-create"
+        ? "Resolve the source publication conflict before creating a new subscription."
+        : context.stage === "subscription-create"
+          ? "Resolve the target subscription or source replication-slot error before retrying."
+          : "Re-run preflight after the resource state is clean.",
+  );
+
+  return {
+    ...classified,
+    title: setupStageTitles[context.stage],
+    stage: context.stage,
+    resource: context.resource,
+    retrySafe: context.retrySafe,
+    partialResources: partial,
+    nextSteps,
+    actions: context.retrySafe
+      ? [{ id: "rerun-setup", label: "Retry setup" }]
+      : [],
+  };
+}
+
 export function classifyError(e: unknown): ClassifiedError {
   const err = asErrorLike(e);
-  const msg = (err.message ?? "").trim();
+  const msg = sanitizeDatabaseError((err.message ?? "").trim());
   const code = err.code;
   const lower = msg.toLowerCase();
+
+  if (err.stage) {
+    return {
+      title: setupStageTitles[err.stage],
+      raw: msg || "Unknown database error",
+      explanation:
+        "Replication setup stopped at a known stage. No connection credentials are included in this message.",
+      nextSteps: [],
+      actions: [],
+      severity: "error",
+      code,
+      stage: err.stage,
+      resource: err.resource ?? null,
+      retrySafe: false,
+    };
+  }
 
   // ── Replication slot already exists ──────────────────────────
   // ERROR: replication slot "xxx" already exists
@@ -275,7 +372,7 @@ export function classifyError(e: unknown): ClassifiedError {
     nextSteps: [
       "Check the raw error for context",
       "Re-run the preceding step to confirm the system state",
-      "If the error persists, check pg_stat_activity on both source and target for stuck queries",
+      "Inspect the affected resource before retrying so a partial operation is not repeated.",
     ],
     actions: [{ id: "rerun-preflight", label: "Re-run preflight" }],
     severity: "error",
