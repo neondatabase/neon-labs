@@ -1389,6 +1389,13 @@ export default function ReplicationPage() {
                     !cutoverResult &&
                     teardownInspection.subscription.state === "absent"
                   }
+                  sourceProjectId={sourceProjectId}
+                  inspectionSqlCopied={
+                    copiedSql === "active-slot-inspection"
+                  }
+                  onCopyInspectionSql={(sql) =>
+                    void copySql("active-slot-inspection", sql)
+                  }
                   onConfirmedChange={setConfirmTeardown}
                   onRetryCleanup={runTeardown}
                   onTeardown={runTeardown}
@@ -2011,6 +2018,9 @@ function TeardownPanel({
   checking,
   recheckAttempts,
   setupRecovery,
+  sourceProjectId,
+  inspectionSqlCopied,
+  onCopyInspectionSql,
   onConfirmedChange,
   onRetryCleanup,
   onTeardown,
@@ -2022,6 +2032,9 @@ function TeardownPanel({
   checking: boolean;
   recheckAttempts: number;
   setupRecovery: boolean;
+  sourceProjectId: string | null;
+  inspectionSqlCopied: boolean;
+  onCopyInspectionSql: (sql: string) => void;
   onConfirmedChange: (confirmed: boolean) => void;
   onRetryCleanup: () => void;
   onTeardown: () => void;
@@ -2043,6 +2056,9 @@ WHERE slot_name = 'neon_advisor_sub';`;
 FROM pg_stat_activity
 WHERE pid = ${inspection.slot.activePid};`
     : null;
+  const sourceInspectionSql = backendInspectionSql
+    ? `${slotInspectionSql}\n\n${backendInspectionSql}`
+    : slotInspectionSql;
 
   return (
     <div className="space-y-4">
@@ -2122,29 +2138,115 @@ WHERE pid = ${inspection.slot.activePid};`
 
       {activeOrphan ? (
         <div className="space-y-3 rounded-[4px] border border-[#f59e0b]/40 bg-[#f59e0b]/[0.08] p-3">
+          <p className="flex items-center gap-2 text-caption font-medium text-[#00e599]">
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            Replication subscription removed
+          </p>
+
+          <div className="border-t border-[#f59e0b]/25 pt-3">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <span className="flex size-5 shrink-0 items-center justify-center rounded-full border border-[#f59e0b]/50 font-mono text-micro text-[#f59e0b]">
+                  2
+                </span>
+                <div>
+                  <p className="text-caption font-medium text-foreground">
+                    Release active source session
+                  </p>
+                  <p className="mt-1 text-label leading-[1.55] text-[#f3f4f6]">
+                    PostgreSQL reports{" "}
+                    <span className="font-mono">neon_advisor_sub</span> active
+                    {inspection.slot.activePid ? (
+                      <>
+                        {" "}
+                        on PID{" "}
+                        <span className="font-mono">
+                          {inspection.slot.activePid}
+                        </span>
+                      </>
+                    ) : null}
+                    . Inspect and end the owning session on the source before
+                    cleanup can continue.
+                  </p>
+                </div>
+              </div>
+              <span className="rounded-full border border-[#f59e0b]/40 px-2 py-0.5 text-micro uppercase tracking-[0.08em] text-[#f59e0b]">
+                Required
+              </span>
+            </div>
+          </div>
+
           <div>
-            <p className="text-caption font-medium text-[#00e599]">
-              Replication subscription removed
-            </p>
-            <p className="mt-1 text-caption font-medium text-[#f59e0b]">
-              Source cleanup is incomplete
+            <p className="tag mb-1">Read-only source inspection</p>
+            <pre className="overflow-x-auto rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-2 font-mono text-micro text-[#f3f4f6]">
+              {sourceInspectionSql}
+            </pre>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              onClick={() => onCopyInspectionSql(sourceInspectionSql)}
+              size="sm"
+              variant="outline"
+            >
+              {inspectionSqlCopied ? (
+                <Check className="h-3.5 w-3.5 text-[#00e599]" />
+              ) : (
+                <Copy className="h-3.5 w-3.5" />
+              )}
+              {inspectionSqlCopied ? "Copied" : "Copy inspection SQL"}
+            </Button>
+            {sourceProjectId ? (
+              <Button
+                onClick={() =>
+                  window.open(
+                    `https://console.neon.tech/app/projects/${sourceProjectId}/sql-editor`,
+                    "_blank",
+                    "noopener,noreferrer",
+                  )
+                }
+                size="sm"
+                variant="outline"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                Open source SQL editor
+              </Button>
+            ) : null}
+            <p className="text-label text-[#9ca3af]">
+              {recheckAttempts < 10
+                ? `Automatic check ${recheckAttempts + 1} of 10`
+                : "Automatic rechecks stopped after the timeout."}
             </p>
           </div>
+
           <p className="text-label leading-[1.55] text-[#f3f4f6]">
-            The target subscription is already absent. PostgreSQL still reports
-            the source replication slot as active
-            {inspection.slot.activePid ? (
-              <>
-                {" "}
-                on PID{" "}
-                <span className="font-mono">{inspection.slot.activePid}</span>
-              </>
-            ) : null}
-            . Waiting for that backend to exit before removing the slot and
-            publication.
+            Confirm the PID belongs to this replication attempt before ending
+            it. This advisor will not call{" "}
+            <span className="font-mono">pg_terminate_backend</span> or force-drop
+            an active slot.
           </p>
-          <div className="flex flex-wrap items-center gap-3">
+
+          <div className="border-t border-[#f59e0b]/25 pt-3">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <span className="flex size-5 shrink-0 items-center justify-center rounded-full border border-[#9ca3af]/40 font-mono text-micro text-[#9ca3af]">
+                  3
+                </span>
+                <div>
+                  <p className="text-caption font-medium text-foreground">
+                    Remove source resources
+                  </p>
+                  <p className="mt-1 font-mono text-label text-[#9ca3af]">
+                    neon_advisor_sub · neon_advisor_pub
+                  </p>
+                </div>
+              </div>
+              <span className="text-micro uppercase tracking-[0.08em] text-[#f59e0b]">
+                Waiting
+              </span>
+            </div>
             <Button
+              className="mt-3"
               disabled={!confirmed || checking || busy}
               onClick={onRetryCleanup}
               size="lg"
@@ -2157,26 +2259,7 @@ WHERE pid = ${inspection.slot.activePid};`
               )}
               Retry cleanup
             </Button>
-            <p className="text-label text-[#9ca3af]">
-              {recheckAttempts < 10
-                ? `Automatic recheck ${recheckAttempts + 1} of 10`
-                : "Automatic rechecks stopped after the timeout."}
-            </p>
           </div>
-          <div>
-            <p className="tag mb-1">Read-only source inspection</p>
-            <pre className="overflow-x-auto rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-2 font-mono text-micro text-[#f3f4f6]">
-              {slotInspectionSql}
-              {backendInspectionSql ? `\n\n${backendInspectionSql}` : ""}
-            </pre>
-          </div>
-          <p className="text-label leading-[1.55] text-[#f3f4f6]">
-            If the PID remains after the target subscription is absent, inspect
-            the backend and end the owning client or session manually. This
-            advisor will not call{" "}
-            <span className="font-mono">pg_terminate_backend</span> or force-drop
-            an active slot. Run teardown again after the slot becomes inactive.
-          </p>
         </div>
       ) : inspection.slot.state === "active" ? (
         <div className="rounded-[4px] border border-[#f59e0b]/40 bg-[#f59e0b]/[0.08] px-3 py-2 text-caption text-[#f59e0b]">
@@ -2201,26 +2284,28 @@ WHERE pid = ${inspection.slot.activePid};`
                 : "I understand that teardown permanently stops replication and removes the replication-based rollback path."}
             </span>
           </label>
-          <Button
-            disabled={!confirmed || busy}
-            onClick={onTeardown}
-            size="lg"
-            variant="destructive"
-          >
-            {busy ? (
-              <>
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Tearing down…
-              </>
-            ) : (
-              <>
-                <Trash2 className="h-3.5 w-3.5" />
-                {setupRecovery
-                  ? "Clean up setup resources"
-                  : "Permanently stop replication"}
-              </>
-            )}
-          </Button>
+          {!activeOrphan ? (
+            <Button
+              disabled={!confirmed || busy}
+              onClick={onTeardown}
+              size="lg"
+              variant="destructive"
+            >
+              {busy ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  Tearing down…
+                </>
+              ) : (
+                <>
+                  <Trash2 className="h-3.5 w-3.5" />
+                  {setupRecovery
+                    ? "Clean up setup resources"
+                    : "Permanently stop replication"}
+                </>
+              )}
+            </Button>
+          ) : null}
         </div>
       ) : null}
 
