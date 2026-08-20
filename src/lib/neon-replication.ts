@@ -1162,6 +1162,7 @@ function failedStep(
 export async function teardown(
   sourceConn: string,
   targetConn: string,
+  opts: { releaseActiveSlot?: boolean } = {},
 ): Promise<ReplicationTeardownResult> {
   const before = await inspectReplicationResources(sourceConn, targetConn);
   const recordedSlotName = before.subscription.slotName ?? before.slot.name;
@@ -1344,11 +1345,64 @@ export async function teardown(
         "SELECT active, active_pid FROM pg_replication_slots WHERE slot_name = $1",
         [recordedSlotName],
       );
+      if (slot.rows[0]?.active && opts.releaseActiveSlot) {
+        const activePid = slot.rows[0].active_pid;
+        if (activePid) {
+          try {
+            const released = await src.query<{ terminated: boolean }>(
+              `SELECT pg_terminate_backend(active_pid) AS terminated
+               FROM pg_replication_slots
+               WHERE slot_name = $1
+                 AND active
+                 AND active_pid = $2`,
+              [recordedSlotName, activePid],
+            );
+            if (released.rows[0]?.terminated) {
+              steps.push({
+                id: "release-slot-session",
+                label: "Release active source session",
+                resource: `${recordedSlotName} · PID ${activePid}`,
+                status: "removed",
+                detail:
+                  "The explicitly confirmed app-owned replication session was ended.",
+              });
+            } else {
+              steps.push(
+                failedStep(
+                  "release-slot-session",
+                  "Release active source session",
+                  `${recordedSlotName} · PID ${activePid}`,
+                  "PostgreSQL did not end the active replication session.",
+                ),
+              );
+            }
+          } catch (error) {
+            steps.push(
+              failedStep(
+                "release-slot-session",
+                "Release active source session",
+                `${recordedSlotName} · PID ${activePid}`,
+                error instanceof Error ? error.message : String(error),
+              ),
+            );
+          }
+        } else {
+          steps.push(
+            failedStep(
+              "release-slot-session",
+              "Release active source session",
+              recordedSlotName,
+              "PostgreSQL reports the slot active but did not return an active PID.",
+            ),
+          );
+        }
+      }
       // Disabling the subscription is asynchronous. Give PostgreSQL a brief
-      // chance to release the walsender, but never terminate it ourselves.
+      // chance to release the walsender. A backend is terminated only after
+      // the user explicitly confirms the fixed app-owned slot and active PID.
       for (
         let attempt = 0;
-        slot.rows[0]?.active && attempt < 5;
+        slot.rows[0]?.active && attempt < 10;
         attempt++
       ) {
         await new Promise((resolve) => setTimeout(resolve, 300));
@@ -1382,7 +1436,11 @@ export async function teardown(
           label: "Confirm source slot is inactive",
           resource: recordedSlotName,
           status: "waiting",
-          detail: `PostgreSQL still reports the slot as active${slot.rows[0].active_pid ? ` on PID ${slot.rows[0].active_pid}` : ""}. Automatic checks timed out without terminating the backend.`,
+          detail: `PostgreSQL still reports the slot as active${slot.rows[0].active_pid ? ` on PID ${slot.rows[0].active_pid}` : ""}. ${
+            opts.releaseActiveSlot
+              ? "The explicitly confirmed release attempt did not stop it."
+              : "Automatic checks timed out without ending the backend."
+          }`,
         });
         steps.push({
           id: "drop-slot",
@@ -1510,7 +1568,7 @@ export async function teardown(
           : []),
         ...(after.slot.state === "active"
           ? [
-              `The target subscription is ${after.subscription.state}. Wait for replication slot ${after.slot.name} to become inactive${after.slot.activePid ? ` after backend PID ${after.slot.activePid} exits` : ""}; this tool will never terminate the backend or force-drop an active slot.`,
+              `The target subscription is ${after.subscription.state}. Replication slot ${after.slot.name} is still active${after.slot.activePid ? ` on backend PID ${after.slot.activePid}` : ""}. Explicitly confirm ending the app-owned replication session before retrying cleanup; an active slot is never force-dropped.`,
               `On the source, inspect SELECT slot_name, active, active_pid FROM pg_replication_slots WHERE slot_name = '${after.slot.name}'; and inspect the reported PID in pg_stat_activity.`,
             ]
           : after.slot.state === "present"

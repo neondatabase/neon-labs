@@ -268,6 +268,7 @@ export interface ReplicationTeardownStep {
     | "disable-subscription"
     | "detach-slot"
     | "drop-subscription"
+    | "release-slot-session"
     | "confirm-slot-inactive"
     | "drop-slot"
     | "drop-publication"
