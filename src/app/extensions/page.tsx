@@ -114,8 +114,7 @@ const columns: ColumnDef<NeonExtension, unknown>[] = [
         .join(" · ");
       return (
         <p
-          className="min-w-56 max-w-80 truncate whitespace-nowrap text-caption text-muted-foreground"
-          title={notes || undefined}
+          className="min-w-56 max-w-80 whitespace-normal text-caption leading-relaxed text-muted-foreground"
         >
           {notes || "—"}
         </p>
@@ -168,14 +167,14 @@ export default function ExtensionsPage() {
   };
 
   return (
-    <div className={`${neon.page} flex h-full flex-col`}>
-      <div className={`${neon.pageContent} flex min-h-0 w-full flex-1 flex-col`}>
+    <div className={neon.page}>
+      <div className={`${neon.pageContent} w-full`}>
         <PageHeader
           title="Extensions"
           subtitle="Full reference of PostgreSQL extensions supported on Neon Serverless Postgres."
         />
 
-        <Card className="flex min-h-0 flex-1 flex-col gap-0">
+        <Card className="gap-0">
           <CardHeader className="border-b border-border px-5 py-4">
             <h2 className={neon.h2}>Extension compatibility</h2>
             <p className={`mt-1 text-caption ${neon.muted}`}>
@@ -281,7 +280,6 @@ export default function ExtensionsPage() {
             onSortingChange={setSorting}
             getRowId={(row) => row.name}
             emptyMessage="No extensions match the current filter."
-            scrollAreaClassName="min-h-0 flex-1"
           />
         </Card>
       </div>
