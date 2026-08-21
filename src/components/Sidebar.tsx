@@ -43,6 +43,8 @@ const ASSESSMENT = [
 
 const REFERENCE = [
   { href: "/extensions", label: "Extensions", icon: Puzzle },
+  // "Cost & features" (/compare) is intentionally omitted while in testing — the page
+  // is reachable by URL; add it here when ready to surface it.
 ];
 
 const RESOURCES = [
