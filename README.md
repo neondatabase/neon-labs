@@ -1,5 +1,12 @@
 # Neon Labs
 
+Neon Labs is a home for experimental tools built around Lakebase Postgres.
+It is a playground for ideas that could help the broader Postgres community.
+It gives us a space to publish early tools, share the code, and learn from how
+developers use them. Over time, some experiments may grow into supported
+features, while others may remain prototypes or lead to better approaches
+elsewhere.
+
 ## Neon Migration Assistant
 
 A Postgres major-version upgrade assessment tool for Neon. Tells you
