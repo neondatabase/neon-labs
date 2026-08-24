@@ -1,6 +1,8 @@
-# Neon Upgrade Advisor
+# Neon Labs
 
-A PostgreSQL major-version upgrade assessment tool for Neon. Tells you
+## Neon Migration Assistant
+
+A Postgres major-version upgrade assessment tool for Neon. Tells you
 what will break between two PG versions, which extensions are supported,
 and which migration path fits your database, before you attempt it.
 
@@ -25,8 +27,8 @@ organization credential across visitors.
 ## Quick start
 
 ```bash
-git clone https://github.com/sav-maya/neon-pgupgrade-advisor.git
-cd neon-pgupgrade-advisor
+git clone https://github.com/neondatabase/neon-labs.git
+cd neon-labs
 npm install
 cp .env.example .env.local
 # add OAuth credentials, or NEON_API_KEY for local development only
