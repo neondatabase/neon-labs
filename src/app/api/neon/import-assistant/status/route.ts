@@ -63,7 +63,7 @@ export async function POST(request: NextRequest) {
       totalRows,
       importStarted: rowCountsByTable.length > 0,
       importComplete: totalRows > 0,
-      consoleUrl: `https://console.neon.tech/app/projects/${projectId}/import`,
+      consoleUrl: "https://console.neon.tech/app/projects",
     };
     return NextResponse.json(result);
   } catch (e) {

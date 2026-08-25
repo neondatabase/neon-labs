@@ -80,7 +80,7 @@ export default function ImportAssistantPage() {
 
   const projectId = override?.projectId ?? cfg?.targetProjectId;
   const consoleUrl = projectId
-    ? `https://console.neon.tech/app/projects/${projectId}/import`
+    ? "https://console.neon.tech/app/projects"
     : null;
 
   /* Readiness counts a project picked in the app (stored as an override), not
