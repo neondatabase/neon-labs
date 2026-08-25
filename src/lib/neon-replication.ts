@@ -27,6 +27,7 @@ const DEFAULT_SUB = ADVISOR_SUBSCRIPTION;
 interface PostgresErrorLike {
   code?: string;
   message?: string;
+  detail?: string;
 }
 
 export class ReplicationSetupError extends Error {
@@ -43,9 +44,18 @@ export class ReplicationSetupError extends Error {
       error && typeof error === "object"
         ? (error as PostgresErrorLike)
         : { message: String(error) };
+    const safeDetail =
+      postgresError.detail &&
+      /^This operation is not supported for (?:unlogged|temporary) tables\.$/i.test(
+        postgresError.detail,
+      )
+        ? postgresError.detail
+        : null;
     super(
       sanitizeDatabaseError(
-        postgresError.message || "Unknown database error",
+        [postgresError.message || "Unknown database error", safeDetail]
+          .filter(Boolean)
+          .join(" "),
       ),
     );
     this.name = "ReplicationSetupError";
@@ -69,6 +79,7 @@ interface ReplicationTableRef {
   schema: string;
   table: string;
   qualifiedName: string;
+  persistence: "p" | "u" | "t";
 }
 
 /** Returns `host` and unpooled (`-pooler` removed) connection string. */
@@ -81,6 +92,10 @@ function quoteIdent(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
 }
 
+function quoteLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
 function tableName(table: Pick<ReplicationTableRef, "schema" | "table">): string {
   return `${table.schema}.${table.table}`;
 }
@@ -88,6 +103,7 @@ function tableName(table: Pick<ReplicationTableRef, "schema" | "table">): string
 async function resolveTableSelection(
   sourceConn: string,
   requestedTables?: string[],
+  options: { allowUnlogged?: boolean } = {},
 ): Promise<ReplicationTableRef[] | null> {
   if (requestedTables === undefined) return null;
   const requested = [...new Set(requestedTables.map((table) => table.trim()))];
@@ -98,8 +114,15 @@ async function resolveTableSelection(
   const src = new Client({ connectionString: unpool(sourceConn) });
   await src.connect();
   try {
-    const available = await src.query<{ schema: string; table: string }>(`
-      SELECT n.nspname AS schema, c.relname AS table
+    const available = await src.query<{
+      schema: string;
+      table: string;
+      persistence: "p" | "u" | "t";
+    }>(`
+      SELECT
+        n.nspname AS schema,
+        c.relname AS table,
+        c.relpersistence AS persistence
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind = 'r'
@@ -123,7 +146,14 @@ async function resolveTableSelection(
         `Selected table${missing.length === 1 ? "" : "s"} not found on source: ${missing.join(", ")}`,
       );
     }
-    return requested.map((name) => byName.get(name)!);
+    const selected = requested.map((name) => byName.get(name)!);
+    const unlogged = selected.filter((table) => table.persistence === "u");
+    if (!options.allowUnlogged && unlogged.length > 0) {
+      throw new Error(
+        `Unlogged tables cannot be published because they do not write WAL: ${unlogged.map((table) => table.qualifiedName).join(", ")}. Deselect them or convert them to LOGGED before retrying.`,
+      );
+    }
+    return selected;
   } finally {
     await src.end();
   }
@@ -144,6 +174,7 @@ export async function preflight(
   const selectedTables = await resolveTableSelection(
     sourceConn,
     requestedTables,
+    { allowUnlogged: true },
   );
   const selectedTableNames = selectedTables
     ? new Set(selectedTables.map((table) => table.qualifiedName))
@@ -163,8 +194,15 @@ export async function preflight(
       )
     ).rows[0];
 
-    const srcTables = await src.query<{ schema: string; table: string }>(`
-      SELECT n.nspname AS schema, c.relname AS table
+    const srcTables = await src.query<{
+      schema: string;
+      table: string;
+      persistence: "p" | "u" | "t";
+    }>(`
+      SELECT
+        n.nspname AS schema,
+        c.relname AS table,
+        c.relpersistence AS persistence
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind = 'r'
         AND n.nspname <> 'information_schema'
@@ -175,8 +213,15 @@ export async function preflight(
         )
       ORDER BY 1, 2
     `);
-    const noPK = await src.query<{ schema: string; table: string }>(`
-      SELECT n.nspname AS schema, c.relname AS table
+    const noPK = await src.query<{
+      schema: string;
+      table: string;
+      replica_identity: "d" | "n" | "f" | "i";
+    }>(`
+      SELECT
+        n.nspname AS schema,
+        c.relname AS table,
+        c.relreplident AS replica_identity
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind = 'r'
@@ -189,6 +234,33 @@ export async function preflight(
         AND NOT EXISTS (
           SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary
         )
+      ORDER BY 1, 2
+    `);
+    const generated = await src.query<{
+      schema: string;
+      table: string;
+      column: string;
+      generation_kind: "s" | "v";
+    }>(`
+      SELECT
+        n.nspname AS schema,
+        c.relname AS table,
+        a.attname AS column,
+        a.attgenerated AS generation_kind
+      FROM pg_attribute a
+      JOIN pg_class c ON c.oid = a.attrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind = 'r'
+        AND a.attnum > 0
+        AND NOT a.attisdropped
+        AND a.attgenerated <> ''
+        AND n.nspname <> 'information_schema'
+        AND n.nspname !~ '^pg_'
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.objid = c.oid AND d.deptype = 'e'
+        )
+      ORDER BY 1, 2, a.attnum
     `);
     const repRole = await src.query<{
       rolreplication: boolean;
@@ -230,11 +302,29 @@ export async function preflight(
           selectedTableNames.has(tableName(table)),
         )
       : srcTables.rows;
+    const sourceUnloggedTables = sourceTables.filter(
+      (table) => table.persistence === "u",
+    );
+    const replicationSourceTables = sourceTables.filter(
+      (table) => table.persistence === "p",
+    );
+    const replicationTableNames = new Set(
+      replicationSourceTables.map(tableName),
+    );
     const sourceTablesWithoutPK = selectedTableNames
       ? noPK.rows.filter((table) =>
-          selectedTableNames.has(tableName(table)),
+          replicationTableNames.has(tableName(table)),
         )
-      : noPK.rows;
+      : noPK.rows.filter((table) =>
+          replicationTableNames.has(tableName(table)),
+        );
+    const sourceGeneratedColumns = selectedTableNames
+      ? generated.rows.filter((column) =>
+          replicationTableNames.has(tableName(column)),
+        )
+      : generated.rows.filter((column) =>
+          replicationTableNames.has(tableName(column)),
+        );
     const walLevel = srcVersion.wal;
     const logicalEnabled = walLevel === "logical";
     const roleHasReplication = Boolean(
@@ -243,15 +333,35 @@ export async function preflight(
     );
     const tableCount = sourceTables.length;
     const tables = sourceTables.map(tableName);
+    const replicationTables = replicationSourceTables.map(tableName);
+    const unloggedTables = sourceUnloggedTables.map(tableName);
     const tablesWithoutPK = sourceTablesWithoutPK.map(tableName);
+    const tablesWithoutReplicaIdentity = sourceTablesWithoutPK
+      .filter(
+        (table) =>
+          table.replica_identity !== "f" && table.replica_identity !== "i",
+      )
+      .map(tableName);
+    const tablesWithReplicaIdentityFull = sourceTablesWithoutPK
+      .filter((table) => table.replica_identity === "f")
+      .map(tableName);
+    const generatedColumns = sourceGeneratedColumns.map((column) => ({
+      table: tableName(column),
+      column: column.column,
+      kind:
+        column.generation_kind === "v"
+          ? ("virtual" as const)
+          : ("stored" as const),
+    }));
     const targetTables = new Set(
       tgtTables.rows.map((r) => `${r.schema}.${r.table}`),
     );
-    const targetSchemaTableCount = selectedTableNames
-      ? tables.filter((table) => targetTables.has(table)).length
-      : targetTables.size;
+    const targetSchemaTableCount = replicationTables.filter((table) =>
+      targetTables.has(table),
+    ).length;
     const targetSchemaLoaded =
-      tableCount > 0 && tables.every((table) => targetTables.has(table));
+      replicationTables.length > 0 &&
+      replicationTables.every((table) => targetTables.has(table));
 
     const blockers: string[] = [];
     const warnings: string[] = [];
@@ -268,14 +378,27 @@ export async function preflight(
     if (tableCount === 0) {
       blockers.push("No user tables found on source.");
     }
-    if (!targetSchemaLoaded) {
+    if (!targetSchemaLoaded && replicationTables.length > 0) {
       warnings.push(
-        `Target schema has ${targetSchemaTableCount}/${tableCount} tables, schema copy will run automatically.`,
+        `Target schema has ${targetSchemaTableCount}/${replicationTables.length} tables, schema copy will run automatically.`,
       );
     }
-    if (tablesWithoutPK.length > 0) {
+    if (unloggedTables.length > 0) {
+      const message = `Unlogged tables cannot be published because they do not write WAL: ${unloggedTables.join(", ")}. Recreate them empty on the target, or convert them to LOGGED if their rows must migrate.`;
+      if (selectedTableNames) {
+        blockers.push(message);
+      } else {
+        warnings.push(`Excluded from logical replication. ${message}`);
+      }
+    }
+    if (tablesWithoutReplicaIdentity.length > 0) {
       warnings.push(
-        `${tablesWithoutPK.length} tables without PRIMARY KEY, updates/deletes won't replicate cleanly: ${tablesWithoutPK.slice(0, 5).join(", ")}${tablesWithoutPK.length > 5 ? "…" : ""}`,
+        `${tablesWithoutReplicaIdentity.length} tables without PRIMARY KEY or usable replica identity; updates/deletes won't replicate: ${tablesWithoutReplicaIdentity.slice(0, 5).join(", ")}${tablesWithoutReplicaIdentity.length > 5 ? "…" : ""}`,
+      );
+    }
+    if (generatedColumns.length > 0) {
+      warnings.push(
+        `The current publication does not transmit generated values. Schema copy will recreate these expressions so the target recomputes them: ${generatedColumns.map(({ table, column }) => `${table}.${column}`).join(", ")}`,
       );
     }
     if (existingSub.rows.length > 0) {
@@ -292,6 +415,10 @@ export async function preflight(
         tableCount,
         tables,
         tablesWithoutPK,
+        tablesWithoutReplicaIdentity,
+        tablesWithReplicaIdentityFull,
+        generatedColumns,
+        unloggedTables,
         roleHasReplication,
         rolname: srcVersion.user,
       },
@@ -315,6 +442,9 @@ export async function preflight(
 interface SchemaCopyReport {
   extensionsCreated: string[];
   extensionsFailed: { name: string; error: string; code?: string }[];
+  typesCreated: string[];
+  typesSkipped: string[];
+  typesFailed: { name: string; error: string; ddl: string; code?: string }[];
   tablesCreated: string[];
   tablesSkipped: string[];
   tablesFailed: { name: string; error: string; ddl: string; code?: string }[];
@@ -335,6 +465,9 @@ async function copySchemaIfNeeded(
   const report: SchemaCopyReport = {
     extensionsCreated: [],
     extensionsFailed: [],
+    typesCreated: [],
+    typesSkipped: [],
+    typesFailed: [],
     tablesCreated: [],
     tablesSkipped: [],
     tablesFailed: [],
@@ -346,17 +479,44 @@ async function copySchemaIfNeeded(
   const tgt = new Client({ connectionString: unpool(targetConn) });
   await Promise.all([src.connect(), tgt.connect()]);
   try {
+    // Force catalog deparsers such as format_type() and pg_get_expr() to
+    // schema-qualify user-defined dependencies.
+    await src.query("SET search_path TO pg_catalog");
+
     const selectedTableNames = selectedTables
       ? new Set(selectedTables.map((table) => table.qualifiedName))
       : null;
+    const selectedSchemas = selectedTables
+      ? [...new Set(selectedTables.map((table) => table.schema))]
+      : null;
+    const referencedTypeSchemas = selectedTableNames
+      ? (
+          await src.query<{ schema: string }>(
+            `SELECT DISTINCT type_ns.nspname AS schema
+             FROM pg_attribute a
+             JOIN pg_class c ON c.oid = a.attrelid
+             JOIN pg_namespace table_ns ON table_ns.oid = c.relnamespace
+             JOIN pg_type t ON t.oid = a.atttypid
+             JOIN pg_namespace type_ns ON type_ns.oid = t.typnamespace
+             WHERE a.attnum > 0
+               AND NOT a.attisdropped
+               AND (table_ns.nspname || '.' || c.relname) = ANY($1::text[])
+               AND type_ns.nspname <> 'information_schema'
+               AND type_ns.nspname !~ '^pg_'`,
+            [[...selectedTableNames]],
+          )
+        ).rows.map(({ schema }) => schema)
+      : null;
+    const customTypeSchemas =
+      selectedSchemas && referencedTypeSchemas
+        ? [...new Set([...selectedSchemas, ...referencedTypeSchemas])]
+        : null;
 
     // 1. User-defined schemas. Logical replication is database-wide, not
     //    limited to `public`, so preserve every non-system schema containing
     //    a user table or sequence.
-    const schemas = selectedTables
-      ? [...new Set(selectedTables.map((table) => table.schema))].map(
-          (schema) => ({ schema }),
-        )
+    const schemas = selectedSchemas
+      ? selectedSchemas.map((schema) => ({ schema }))
       : (
           await src.query<{ schema: string }>(`
             SELECT DISTINCT n.nspname AS schema
@@ -388,13 +548,38 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 2. Extensions
-    const exts = await src.query<{ extname: string }>(
-      "SELECT extname FROM pg_extension WHERE extname NOT IN ('plpgsql') ORDER BY extname",
-    );
+    // 2. Extensions. Preserve the source installation schema so extension
+    //    types and functions resolve the same way when custom types are copied.
+    const exts = await src.query<{ extname: string; schema: string }>(`
+      SELECT e.extname, n.nspname AS schema
+      FROM pg_extension e
+      JOIN pg_namespace n ON n.oid = e.extnamespace
+      WHERE e.extname <> 'plpgsql'
+      ORDER BY e.extname
+    `);
     for (const e of exts.rows) {
       try {
-        await tgt.query(`CREATE EXTENSION IF NOT EXISTS "${e.extname}"`);
+        await tgt.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(e.schema)}`);
+        const installed = await tgt.query<{ schema: string }>(
+          `SELECT n.nspname AS schema
+           FROM pg_extension x
+           JOIN pg_namespace n ON n.oid = x.extnamespace
+           WHERE x.extname = $1`,
+          [e.extname],
+        );
+        if (
+          installed.rows[0] &&
+          installed.rows[0].schema !== e.schema
+        ) {
+          throw new Error(
+            `Extension is already installed in schema ${installed.rows[0].schema}; source uses ${e.schema}.`,
+          );
+        }
+        if (installed.rows.length === 0) {
+          await tgt.query(
+            `CREATE EXTENSION ${quoteIdent(e.extname)} WITH SCHEMA ${quoteIdent(e.schema)}`,
+          );
+        }
         report.extensionsCreated.push(e.extname);
       } catch (err) {
         report.extensionsFailed.push({
@@ -408,7 +593,195 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 3. Sequences first, column defaults like nextval('foo_id_seq'::regclass)
+    // 3. User-defined enum, domain, and composite types must exist before
+    //    table DDL references them. Extension-owned types are excluded because
+    //    the extension installation above creates them.
+    const enumTypes = await src.query<{
+      schema: string;
+      type: string;
+      labels: string[];
+    }>(
+      `SELECT
+         n.nspname AS schema,
+         t.typname AS type,
+         array_agg(e.enumlabel ORDER BY e.enumsortorder) AS labels
+       FROM pg_type t
+       JOIN pg_namespace n ON n.oid = t.typnamespace
+       JOIN pg_enum e ON e.enumtypid = t.oid
+       WHERE t.typtype = 'e'
+         AND n.nspname <> 'information_schema'
+         AND n.nspname !~ '^pg_'
+         AND ($1::text[] IS NULL OR n.nspname = ANY($1::text[]))
+         AND NOT EXISTS (
+           SELECT 1
+           FROM pg_depend d
+           JOIN pg_extension x ON x.oid = d.refobjid
+           WHERE d.classid = 'pg_type'::regclass
+             AND d.objid = t.oid
+             AND d.deptype = 'e'
+         )
+       GROUP BY t.oid, n.nspname, t.typname
+       ORDER BY t.oid`,
+      [customTypeSchemas],
+    );
+    const domainTypes = await src.query<{
+      schema: string;
+      type: string;
+      base_type: string;
+      not_null: boolean;
+      default_expr: string | null;
+      constraints: { name: string; definition: string }[];
+    }>(
+      `SELECT
+         n.nspname AS schema,
+         t.typname AS type,
+         pg_catalog.format_type(t.typbasetype, t.typtypmod) AS base_type,
+         t.typnotnull AS not_null,
+         pg_get_expr(t.typdefaultbin, 0) AS default_expr,
+         COALESCE(
+           (
+             SELECT json_agg(
+               json_build_object(
+                 'name', c.conname,
+                 'definition', pg_get_constraintdef(c.oid, true)
+               )
+               ORDER BY c.conname
+             )
+             FROM pg_constraint c
+             WHERE c.contypid = t.oid
+           ),
+           '[]'::json
+         ) AS constraints
+       FROM pg_type t
+       JOIN pg_namespace n ON n.oid = t.typnamespace
+       WHERE t.typtype = 'd'
+         AND n.nspname <> 'information_schema'
+         AND n.nspname !~ '^pg_'
+         AND ($1::text[] IS NULL OR n.nspname = ANY($1::text[]))
+         AND NOT EXISTS (
+           SELECT 1
+           FROM pg_depend d
+           JOIN pg_extension x ON x.oid = d.refobjid
+           WHERE d.classid = 'pg_type'::regclass
+             AND d.objid = t.oid
+             AND d.deptype = 'e'
+         )
+       ORDER BY t.oid`,
+      [customTypeSchemas],
+    );
+    const compositeTypes = await src.query<{
+      schema: string;
+      type: string;
+      attributes: { name: string; formatted_type: string }[];
+    }>(
+      `SELECT
+         n.nspname AS schema,
+         t.typname AS type,
+         (
+           SELECT json_agg(
+             json_build_object(
+               'name', a.attname,
+               'formatted_type',
+               pg_catalog.format_type(a.atttypid, a.atttypmod)
+             )
+             ORDER BY a.attnum
+           )
+           FROM pg_attribute a
+           WHERE a.attrelid = t.typrelid
+             AND a.attnum > 0
+             AND NOT a.attisdropped
+         ) AS attributes
+       FROM pg_type t
+       JOIN pg_namespace n ON n.oid = t.typnamespace
+       JOIN pg_class c ON c.oid = t.typrelid
+       WHERE t.typtype = 'c'
+         AND c.relkind = 'c'
+         AND n.nspname <> 'information_schema'
+         AND n.nspname !~ '^pg_'
+         AND ($1::text[] IS NULL OR n.nspname = ANY($1::text[]))
+         AND NOT EXISTS (
+           SELECT 1
+           FROM pg_depend d
+           JOIN pg_extension x ON x.oid = d.refobjid
+           WHERE d.classid = 'pg_type'::regclass
+             AND d.objid = t.oid
+             AND d.deptype = 'e'
+         )
+       ORDER BY t.oid`,
+      [customTypeSchemas],
+    );
+    const existingTypes = new Set(
+      (
+        await tgt.query<{ schema: string; type: string }>(`
+          SELECT n.nspname AS schema, t.typname AS type
+          FROM pg_type t
+          JOIN pg_namespace n ON n.oid = t.typnamespace
+        `)
+      ).rows.map(({ schema, type }) => `${schema}.${type}`),
+    );
+    const typeDefinitions = [
+      ...enumTypes.rows.map((type) => ({
+        schema: type.schema,
+        type: type.type,
+        ddl: `CREATE TYPE ${quoteIdent(type.schema)}.${quoteIdent(type.type)} AS ENUM (${type.labels.map(quoteLiteral).join(", ")})`,
+      })),
+      ...domainTypes.rows.map((type) => {
+        const defaultClause = type.default_expr
+          ? ` DEFAULT ${type.default_expr}`
+          : "";
+        const notNullClause = type.not_null ? " NOT NULL" : "";
+        const constraints = Array.isArray(type.constraints)
+          ? type.constraints
+              .map(
+                (constraint) =>
+                  ` CONSTRAINT ${quoteIdent(constraint.name)} ${constraint.definition}`,
+              )
+              .join("")
+          : "";
+        return {
+          schema: type.schema,
+          type: type.type,
+          ddl: `CREATE DOMAIN ${quoteIdent(type.schema)}.${quoteIdent(type.type)} AS ${type.base_type}${defaultClause}${notNullClause}${constraints}`,
+        };
+      }),
+      ...compositeTypes.rows.map((type) => ({
+        schema: type.schema,
+        type: type.type,
+        ddl: `CREATE TYPE ${quoteIdent(type.schema)}.${quoteIdent(type.type)} AS (${(type.attributes ?? [])
+          .map(
+            (attribute) =>
+              `${quoteIdent(attribute.name)} ${attribute.formatted_type}`,
+          )
+          .join(", ")})`,
+      })),
+    ];
+    for (const definition of typeDefinitions) {
+      const qualifiedName = `${definition.schema}.${definition.type}`;
+      if (existingTypes.has(qualifiedName)) {
+        report.typesSkipped.push(qualifiedName);
+        continue;
+      }
+      try {
+        await tgt.query(
+          `CREATE SCHEMA IF NOT EXISTS ${quoteIdent(definition.schema)}`,
+        );
+        await tgt.query(definition.ddl);
+        existingTypes.add(qualifiedName);
+        report.typesCreated.push(qualifiedName);
+      } catch (err) {
+        report.typesFailed.push({
+          name: qualifiedName,
+          error: err instanceof Error ? err.message : String(err),
+          ddl: definition.ddl,
+          code:
+            err && typeof err === "object"
+              ? (err as PostgresErrorLike).code
+              : undefined,
+        });
+      }
+    }
+
+    // 4. Sequences first, column defaults like nextval('foo_id_seq'::regclass)
     //    will fail if the sequence doesn't exist on the target.
     const sequences = await src.query<{
       schema: string;
@@ -473,7 +846,7 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 4. Tables (user tables only, exclude tables owned by extensions like
+    // 5. Tables (user tables only, exclude tables owned by extensions like
     //    pg_stat_statements).
     const tables = await src.query<{ schema: string; table: string }>(`
       SELECT n.nspname AS schema, c.relname AS table
@@ -510,12 +883,14 @@ async function copySchemaIfNeeded(
         attname: string;
         formatted_type: string;
         attnotnull: boolean;
+        attgenerated: "" | "s" | "v";
         column_default: string | null;
       }>(
         `SELECT
            a.attname,
            pg_catalog.format_type(a.atttypid, a.atttypmod) AS formatted_type,
            a.attnotnull,
+           a.attgenerated,
            pg_get_expr(ad.adbin, ad.adrelid) AS column_default
          FROM pg_attribute a
          LEFT JOIN pg_attrdef ad
@@ -534,26 +909,49 @@ async function copySchemaIfNeeded(
         [t.schema, t.table],
       );
 
-      const colDefs = cols.rows
-        .map((c) => {
-          const nn = c.attnotnull ? " NOT NULL" : "";
-          const def = c.column_default ? ` DEFAULT ${c.column_default}` : "";
-          return `"${c.attname}" ${c.formatted_type}${def}${nn}`;
-        })
-        .join(", ");
       const pk =
         pkCols.rows.length > 0
           ? `, PRIMARY KEY (${pkCols.rows.map((p) => `"${p.attname}"`).join(", ")})`
           : "";
-      const ddl = `CREATE TABLE "${t.schema}"."${t.table}" (${colDefs}${pk})`;
+      const generatedColumnNames = cols.rows
+        .filter((column) => column.attgenerated !== "")
+        .map((column) => `${t.schema}.${t.table}.${column.attname}`);
+      let ddl = "";
       try {
+        const colDefs = cols.rows
+          .map((column) => {
+            const notNull = column.attnotnull ? " NOT NULL" : "";
+            let value = "";
+            if (column.attgenerated !== "") {
+              if (!column.column_default) {
+                throw new Error(
+                  `Generated column ${t.schema}.${t.table}.${column.attname} has no generation expression.`,
+                );
+              }
+              const persistence =
+                column.attgenerated === "v" ? "VIRTUAL" : "STORED";
+              value = ` GENERATED ALWAYS AS (${column.column_default}) ${persistence}`;
+            } else if (column.column_default) {
+              value = ` DEFAULT ${column.column_default}`;
+            }
+            return `${quoteIdent(column.attname)} ${column.formatted_type}${value}${notNull}`;
+          })
+          .join(", ");
+        ddl = `CREATE TABLE ${quoteIdent(t.schema)}.${quoteIdent(t.table)} (${colDefs}${pk})`;
         await tgt.query(ddl);
         report.tablesCreated.push(`${t.schema}.${t.table}`);
       } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        const generatedContext =
+          generatedColumnNames.length > 0
+            ? `Generated columns: ${generatedColumnNames.join(", ")}. `
+            : "";
         report.tablesFailed.push({
           name: `${t.schema}.${t.table}`,
-          error: err instanceof Error ? err.message : String(err),
-          ddl,
+          error: `${generatedContext}${error}`,
+          ddl:
+            ddl ||
+            `CREATE TABLE ${quoteIdent(t.schema)}.${quoteIdent(t.table)} (...)`,
           code:
             err && typeof err === "object"
               ? (err as PostgresErrorLike).code
@@ -562,7 +960,7 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 5. Indexes (non-PK, since PKs were inlined above).
+    // 6. Indexes (non-PK, since PKs were inlined above).
     //    Use pg_get_indexdef() which produces fully qualified, valid DDL.
     const indexes = await src.query<{
       schema: string;
@@ -674,12 +1072,15 @@ export async function setupReplication(
   }
   if (schemaReport.tablesFailed.length > 0) {
     const firstFailure = schemaReport.tablesFailed[0];
+    const firstTypeFailure = schemaReport.typesFailed[0];
     throw setupFailure(
       "schema-copy",
       firstFailure.name,
       {
-        message: `Schema copy failed for ${schemaReport.tablesFailed.length} table(s). ${firstFailure.error}`,
-        code: firstFailure.code,
+        message: firstTypeFailure
+          ? `Schema copy failed for ${schemaReport.tablesFailed.length} table(s). Custom type ${firstTypeFailure.name} could not be recreated first: ${firstTypeFailure.error}. ${firstFailure.error}`
+          : `Schema copy failed for ${schemaReport.tablesFailed.length} table(s). ${firstFailure.error}`,
+        code: firstTypeFailure?.code ?? firstFailure.code,
       },
     );
   }

@@ -94,6 +94,9 @@ export function attachSetupFailureContext(
     /replication slot ["']?[^"'\s]+["']?\s+already exists/i.test(
       classified.raw,
     );
+  const extensionSchemaMismatch = classified.raw.match(
+    /^Extension copy failed for (.+?)\. Extension is already installed in schema (.+?); source uses (.+?)\.$/i,
+  );
   const nextSteps: string[] = [];
   if (partial?.subscription.state === "present") {
     nextSteps.push(
@@ -117,24 +120,37 @@ export function attachSetupFailureContext(
       "Resource inspection could not prove that retrying is safe. Refresh and inspect replication resources before retrying.",
     );
   }
-  nextSteps.push(
-    context.stage === "schema-copy"
-      ? "Resolve the missing table, type, function, extension, or default-expression dependency named by the database error."
-      : context.stage === "publication-create"
-        ? "Resolve the source publication conflict before creating a new subscription."
-        : context.stage === "subscription-create"
-          ? "Resolve the target subscription or source replication-slot error before retrying."
-          : "Re-run preflight after the resource state is clean.",
-  );
+  if (extensionSchemaMismatch) {
+    const [, extension, targetSchema, sourceSchema] =
+      extensionSchemaMismatch;
+    nextSteps.push(
+      `On the target, move extension "${extension}" from schema "${targetSchema}" to "${sourceSchema}" if it is relocatable. Otherwise, use a fresh target or recreate the extension in "${sourceSchema}".`,
+      "Retry setup after the target extension schema matches the source.",
+    );
+  } else {
+    nextSteps.push(
+      context.stage === "schema-copy"
+        ? "Resolve the missing table, type, function, extension, or default-expression dependency named by the database error."
+        : context.stage === "publication-create"
+          ? "Resolve the source publication conflict before creating a new subscription."
+          : context.stage === "subscription-create"
+            ? "Resolve the target subscription or source replication-slot error before retrying."
+            : "Re-run preflight after the resource state is clean.",
+    );
+  }
 
   return {
     ...classified,
     title: duplicateSlot
       ? "Existing replication slot"
-      : setupStageTitles[context.stage],
+      : extensionSchemaMismatch
+        ? "Extension schema mismatch"
+        : setupStageTitles[context.stage],
     explanation: duplicateSlot
       ? "PostgreSQL could not create the subscription because its source replication slot already exists. Complete setup recovery before retrying."
-      : classified.explanation,
+      : extensionSchemaMismatch
+        ? `The target already has extension "${extensionSchemaMismatch[1]}" in schema "${extensionSchemaMismatch[2]}", but the source uses "${extensionSchemaMismatch[3]}". Setup stopped before recreating dependent custom types and tables.`
+        : classified.explanation,
     stage: context.stage,
     resource: context.resource,
     retrySafe: context.retrySafe,

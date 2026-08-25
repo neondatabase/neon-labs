@@ -130,6 +130,18 @@ export interface ReplicationPreflight {
     tableCount: number;
     tables: string[];
     tablesWithoutPK: string[];
+    /** No-PK tables that still cannot identify rows for UPDATE/DELETE. */
+    tablesWithoutReplicaIdentity?: string[];
+    /** No-PK tables covered by REPLICA IDENTITY FULL. */
+    tablesWithReplicaIdentityFull?: string[];
+    /** Generated columns recreated on the target instead of transmitted. */
+    generatedColumns?: {
+      table: string;
+      column: string;
+      kind: "stored" | "virtual";
+    }[];
+    /** Source tables excluded because unlogged relations have no WAL. */
+    unloggedTables?: string[];
     roleHasReplication: boolean;
     rolname: string;
   };
