@@ -113,6 +113,7 @@ export default function ReplicationPage() {
     null,
   );
   const [confirmCutover, setConfirmCutover] = useState(false);
+  const [sourceWritesStopped, setSourceWritesStopped] = useState(false);
   const [copiedConn, setCopiedConn] = useState(false);
   const [monitor, setMonitor] = useState<ReplicationMonitor | null>(null);
   const [monitorLoading, setMonitorLoading] = useState(false);
@@ -131,6 +132,8 @@ export default function ReplicationPage() {
   const [teardownInspecting, setTeardownInspecting] = useState(false);
   const [teardownRecheckAttempts, setTeardownRecheckAttempts] = useState(0);
   const recoveryChecks = useRef(new Set<string>());
+  const statusPollAbort = useRef<AbortController | null>(null);
+  const statusPollRequest = useRef(0);
 
   useEffect(() => {
     // Hydrate tab-scoped project choices after the client mounts.
@@ -397,30 +400,69 @@ export default function ReplicationPage() {
 
   // Auto-poll status during monitoring phase
   const pollStatus = useCallback(async () => {
+    if (statusPollAbort.current) return;
+    const controller = new AbortController();
+    const requestId = ++statusPollRequest.current;
+    statusPollAbort.current = controller;
     try {
       const res = await fetch("/api/neon/replication/status", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(targetBody()),
+        signal: controller.signal,
       });
       const body = await res.json();
-      if (res.ok) setStatus(body);
+      if (
+        res.ok &&
+        !controller.signal.aborted &&
+        requestId === statusPollRequest.current
+      ) {
+        setStatus(body);
+      }
     } catch {
       /* swallow polling errors */
+    } finally {
+      if (statusPollAbort.current === controller) {
+        statusPollAbort.current = null;
+      }
     }
   }, [targetBody]);
 
   useEffect(() => {
-    if (phase !== "monitoring") return;
-    const initial = window.setTimeout(() => void pollStatus(), 0);
-    const i = setInterval(pollStatus, 3000);
+    if (phase !== "monitoring") {
+      statusPollRequest.current += 1;
+      statusPollAbort.current?.abort();
+      statusPollAbort.current = null;
+      return;
+    }
+
+    let cancelled = false;
+    let timeout: number | null = null;
+    const pollAndSchedule = async () => {
+      await pollStatus();
+      if (!cancelled) {
+        timeout = window.setTimeout(() => void pollAndSchedule(), 3000);
+      }
+    };
+    const pollWhenVisible = () => {
+      if (document.visibilityState === "visible") void pollStatus();
+    };
+
+    void pollAndSchedule();
+    document.addEventListener("visibilitychange", pollWhenVisible);
     return () => {
-      window.clearTimeout(initial);
-      clearInterval(i);
+      cancelled = true;
+      if (timeout !== null) window.clearTimeout(timeout);
+      document.removeEventListener("visibilitychange", pollWhenVisible);
+      statusPollRequest.current += 1;
+      statusPollAbort.current?.abort();
+      statusPollAbort.current = null;
     };
   }, [phase, pollStatus]);
 
   async function runPreflight() {
+    setConfirmCutover(false);
+    setSourceWritesStopped(false);
     setPhase("preflighting");
     setError(null);
     try {
@@ -500,6 +542,8 @@ export default function ReplicationPage() {
   }
 
   async function runSetup() {
+    setConfirmCutover(false);
+    setSourceWritesStopped(false);
     setPhase("setting-up");
     setError(null);
     setResumedSession(false);
@@ -551,6 +595,8 @@ export default function ReplicationPage() {
   }
 
   async function runCutoverPreflight() {
+    setConfirmCutover(false);
+    setSourceWritesStopped(false);
     setPhase("cutover-preflight");
     setError(null);
     try {
@@ -571,6 +617,7 @@ export default function ReplicationPage() {
   }
 
   async function executeCutover() {
+    if (!sourceWritesStopped) return;
     if (!confirmCutover) {
       setConfirmCutover(true);
       return;
@@ -581,13 +628,17 @@ export default function ReplicationPage() {
       const res = await fetch("/api/neon/cutover/execute", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(targetBody()),
+        body: JSON.stringify({
+          ...targetBody(),
+          sourceWritesStopped,
+        }),
       });
       const body = await res.json();
       if (!res.ok) throw new Error(handleApiError(body, `Failed (${res.status})`));
       setClassifiedError(null);
       setCutoverResult(body);
       setConfirmCutover(false);
+      setSourceWritesStopped(false);
       setPhase("cutover-complete");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Cutover failed");
@@ -631,6 +682,8 @@ export default function ReplicationPage() {
       setClassifiedError(null);
       setCutoverResult(null);
       setCutoverPre(null);
+      setConfirmCutover(false);
+      setSourceWritesStopped(false);
       setPhase("monitoring");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Rollback failed");
@@ -763,6 +816,8 @@ export default function ReplicationPage() {
             setMonitor(null);
             setCutoverPre(null);
             setCutoverResult(null);
+            setConfirmCutover(false);
+            setSourceWritesStopped(false);
             setSelectedTables([]);
             setTableSelectionReady(false);
             setResumedSession(false);
@@ -790,6 +845,8 @@ export default function ReplicationPage() {
             setMonitor(null);
             setCutoverPre(null);
             setCutoverResult(null);
+            setConfirmCutover(false);
+            setSourceWritesStopped(false);
             setResumedSession(false);
             setTeardownInspection(null);
             setTeardownResult(null);
@@ -1109,7 +1166,13 @@ export default function ReplicationPage() {
             danger
             action={
               <div className="flex flex-col items-end gap-2">
-                <Button size="lg"
+                <Button
+                  className={
+                    confirmEnable
+                      ? "bg-[#ef4444] text-white opacity-100 hover:bg-[#dc2626] dark:bg-[#ef4444] dark:hover:bg-[#dc2626]"
+                      : undefined
+                  }
+                  size="lg"
                   onClick={enableSourceLogicalReplication}
                   disabled={!authenticated || phase === "enabling"}
                   variant={confirmEnable ? "destructive" : "white"}
@@ -1122,7 +1185,7 @@ export default function ReplicationPage() {
                   ) : confirmEnable ? (
                     <>
                       <AlertOctagon className="h-3.5 w-3.5" />
-                      Confirm — this is irreversible
+                      Yes, enable logical replication
                     </>
                   ) : (
                     <>
@@ -1460,56 +1523,106 @@ export default function ReplicationPage() {
             subtitle="Drain lag, reset sequences, disable subscription, swap connection strings"
             danger
             action={
-              !cutoverPre ? (
-                <Button size="lg" variant="white"
-                  onClick={runCutoverPreflight}
-                  disabled={phase === "cutover-preflight"}
-                >
-                  {phase === "cutover-preflight" ? (
-                    <>
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      Checking…
-                    </>
-                  ) : (
-                    <>
-                      <RefreshCw className="h-3.5 w-3.5" />
-                      Cutover preflight
-                    </>
-                  )}
-                </Button>
-              ) : (
-                <div className="flex gap-2">
-                  <Button size="lg" variant="ghost" onClick={runCutoverPreflight}>
-                    <RefreshCw className="h-3.5 w-3.5" />
-                    Re-check
-                  </Button>
-                  <Button size="lg"
-                    onClick={executeCutover}
-                    disabled={!cutoverPre.ok || phase === "cutting-over"}
-                    variant={confirmCutover ? "destructive" : "white"}
+              <div className="flex max-w-[480px] flex-col items-end gap-2">
+                {cutoverPre ? (
+                  <label className="flex cursor-pointer items-start gap-2 text-left text-label leading-[1.5] text-foreground">
+                    <input
+                      aria-describedby="cutover-source-impact"
+                      checked={sourceWritesStopped}
+                      className="mt-0.5 size-3.5 shrink-0 accent-[#f59e0b]"
+                      disabled={phase === "cutting-over"}
+                      onChange={(event) => {
+                        setSourceWritesStopped(event.target.checked);
+                        if (!event.target.checked) setConfirmCutover(false);
+                      }}
+                      type="checkbox"
+                    />
+                    <span>
+                      I confirm that all application writes to the source
+                      database are stopped.
+                    </span>
+                  </label>
+                ) : null}
+                {!cutoverPre ? (
+                  <Button
+                    disabled={phase === "cutover-preflight"}
+                    onClick={runCutoverPreflight}
+                    size="lg"
+                    variant="white"
                   >
-                    {phase === "cutting-over" ? (
+                    {phase === "cutover-preflight" ? (
                       <>
                         <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        Cutting over…
-                      </>
-                    ) : confirmCutover ? (
-                      <>
-                        <AlertOctagon className="h-3.5 w-3.5" />
-                        Confirm cutover
+                        Checking…
                       </>
                     ) : (
                       <>
-                        <Repeat className="h-3.5 w-3.5" />
-                        Execute cutover
+                        <RefreshCw className="h-3.5 w-3.5" />
+                        Cutover preflight
                       </>
                     )}
                   </Button>
-                </div>
-              )
+                ) : (
+                  <div className="flex gap-2">
+                    <Button
+                      onClick={runCutoverPreflight}
+                      size="lg"
+                      variant="ghost"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      Re-check
+                    </Button>
+                    <Button
+                      aria-describedby="cutover-source-impact"
+                      className={
+                        confirmCutover
+                          ? "border-[#f59e0b] bg-[#f59e0b] text-black opacity-100 hover:bg-[#fbbf24] dark:bg-[#f59e0b] dark:hover:bg-[#fbbf24]"
+                          : undefined
+                      }
+                      disabled={
+                        !cutoverPre.ok ||
+                        !sourceWritesStopped ||
+                        phase === "cutting-over"
+                      }
+                      onClick={executeCutover}
+                      size="lg"
+                      variant={confirmCutover ? "outline" : "white"}
+                    >
+                      {phase === "cutting-over" ? (
+                        <>
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          Cutting over…
+                        </>
+                      ) : confirmCutover ? (
+                        <>
+                          <AlertOctagon className="h-3.5 w-3.5" />
+                          Confirm switch to target
+                        </>
+                      ) : (
+                        <>
+                          <Repeat className="h-3.5 w-3.5" />
+                          Execute cutover
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                )}
+              </div>
             }
           >
-            {cutoverPre && <CutoverPreflightDetails p={cutoverPre} />}
+            <p
+              className={`text-caption leading-[1.5] ${neon.muted}`}
+              id="cutover-source-impact"
+            >
+              Your source database stays running and unchanged. Cutover
+              synchronizes target sequences, disables the target subscription,
+              and returns the target connection string.
+            </p>
+            {cutoverPre && (
+              <div className="mt-4">
+                <CutoverPreflightDetails p={cutoverPre} />
+              </div>
+            )}
           </Section>
         )}
 
@@ -1871,7 +1984,7 @@ function MigrationProgress({
             const isCurrent = index + 1 === currentStep;
             const markerClass = {
               completed: "border-[#00e599] bg-[#00e599]",
-              current: "border-[#00e599] bg-[#131414] shadow-[0_0_0_3px_rgba(0,229,153,0.10)]",
+              current: "border-[#00e599] bg-[#131414]",
               blocked: "border-[#f59e0b] bg-[#f59e0b]",
               upcoming: "border-[#4b4d4d] bg-[#131414]",
             }[state];
@@ -3038,6 +3151,7 @@ WHERE pid = ${inspection.slot.activePid};`
           </label>
           {!activeOrphan ? (
             <Button
+              className="bg-[#ef4444] text-white opacity-100 hover:bg-[#dc2626] dark:bg-[#ef4444] dark:hover:bg-[#dc2626]"
               disabled={!confirmed || busy}
               onClick={onTeardown}
               size="lg"
@@ -3052,8 +3166,8 @@ WHERE pid = ${inspection.slot.activePid};`
                 <>
                   <Trash2 className="h-3.5 w-3.5" />
                   {setupRecovery
-                    ? "Clean up setup resources"
-                    : "Permanently stop replication"}
+                    ? "Yes, clean up setup resources"
+                    : "Yes, permanently stop replication"}
                 </>
               )}
             </Button>

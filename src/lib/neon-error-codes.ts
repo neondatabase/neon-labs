@@ -323,28 +323,6 @@ export function classifyError(e: unknown): ClassifiedError {
     };
   }
 
-  // ── Sequence reset DO block hit a null seq_name ─────────────
-  // pg_get_serial_sequence returns NULL for columns whose default uses
-  // nextval() but where the sequence isn't formally owned by the column.
-  if (
-    code === "22004" ||
-    lower.includes("query string argument of execute is null")
-  ) {
-    return {
-      title: "Sequence reset hit an unowned sequence",
-      raw: msg,
-      explanation:
-        "The DO block that resets target sequences uses pg_get_serial_sequence(), which returns NULL when a column's nextval() default references a sequence that isn't formally owned by the column (no ALTER SEQUENCE OWNED BY). The newer cutover code parses the sequence name out of column_default as a fallback and skips truly unresolvable rows.",
-      nextSteps: [
-        "Re-run cutover — the NULL-guarded version of the DO block now resolves sequences from column_default when pg_get_serial_sequence is silent",
-        "If it still fails, inspect: SELECT table_name, column_name, column_default FROM information_schema.columns WHERE column_default LIKE 'nextval%' AND pg_get_serial_sequence(table_schema || '.' || table_name, column_name) IS NULL",
-      ],
-      actions: [{ id: "rerun-preflight", label: "Re-run preflight" }],
-      severity: "error",
-      code: code ?? "22004",
-    };
-  }
-
   // ── Neon API auth failures ──────────────────────────────────
   if (msg.includes("Neon API 401") || msg.includes("Neon API 403")) {
     return {

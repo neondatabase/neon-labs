@@ -9,6 +9,7 @@ import { classifyError } from "@/lib/neon-error-codes";
 export async function POST(request: NextRequest) {
   let body: {
     dryRun?: boolean;
+    sourceWritesStopped?: boolean;
     sourceConnectionString?: string;
     targetConnectionString?: string;
   } = {};
@@ -16,6 +17,15 @@ export async function POST(request: NextRequest) {
     body = await request.json();
   } catch {
     /* allow empty body */
+  }
+  if (body.sourceWritesStopped !== true) {
+    return NextResponse.json(
+      {
+        error:
+          "Confirm that all application writes to the source database are stopped before cutover.",
+      },
+      { status: 400 },
+    );
   }
   const { source, target: effectiveTarget } = await resolveConnections(body);
   if (!source || !effectiveTarget) {

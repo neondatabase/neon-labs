@@ -452,12 +452,62 @@ interface SchemaCopyReport {
   indexesFailed: { name: string; error: string }[];
 }
 
+interface SequenceColumnReference {
+  schema: string;
+  table: string;
+  column: string;
+}
+
+interface SourceSequenceDefinition {
+  schema: string;
+  name: string;
+  data_type: "smallint" | "integer" | "bigint";
+  start_value: string;
+  increment_by: string;
+  min_value: string;
+  max_value: string;
+  cache_size: string;
+  cycles: boolean;
+  owner_schema: string | null;
+  owner_table: string | null;
+  owner_column: string | null;
+  dependency_type: "a" | "i" | null;
+  default_references: SequenceColumnReference[];
+}
+
+function sequenceInteger(value: string, field: string): string {
+  if (!/^-?\d+$/.test(value)) {
+    throw new Error(`Invalid ${field} returned by PostgreSQL: ${value}`);
+  }
+  return value;
+}
+
+function qualifiedIdentifier(schema: string, name: string): string {
+  return `${quoteIdent(schema)}.${quoteIdent(name)}`;
+}
+
+function sequenceOptions(sequence: SourceSequenceDefinition): string {
+  const increment = sequenceInteger(sequence.increment_by, "sequence increment");
+  const min = sequenceInteger(sequence.min_value, "sequence minimum");
+  const max = sequenceInteger(sequence.max_value, "sequence maximum");
+  const start = sequenceInteger(sequence.start_value, "sequence start");
+  const cache = sequenceInteger(sequence.cache_size, "sequence cache");
+  return [
+    `INCREMENT BY ${increment}`,
+    `MINVALUE ${min}`,
+    `MAXVALUE ${max}`,
+    `START WITH ${start}`,
+    `CACHE ${cache}`,
+    sequence.cycles ? "CYCLE" : "NO CYCLE",
+  ].join(" ");
+}
+
 /** Copy schema from source to target via pg_catalog introspection.
     Uses pg_catalog.format_type() (proper SQL types like "character varying(50)",
     "timestamp with time zone[]") so the DDL round-trips correctly across
     PG14 → PG17. Returns a detailed report so failures surface to the UI.
     For absolute pg_dump fidelity, run `pg_dump --schema-only` out of band. */
-async function copySchemaIfNeeded(
+export async function copySchemaIfNeeded(
   sourceConn: string,
   targetConn: string,
   selectedTables: ReplicationTableRef[] | null,
@@ -781,63 +831,136 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 4. Sequences first, column defaults like nextval('foo_id_seq'::regclass)
-    //    will fail if the sequence doesn't exist on the target.
-    const sequences = await src.query<{
-      schema: string;
-      seq: string;
-      owner_schema: string | null;
-      owner_table: string | null;
-    }>(`
-      SELECT DISTINCT
-        n.nspname AS schema,
-        c.relname AS seq,
-        COALESCE(owned_ns.nspname, default_ns.nspname) AS owner_schema,
-        COALESCE(owned_table.relname, default_table.relname) AS owner_table
-      FROM pg_class c
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-      LEFT JOIN pg_depend owned_dep
-        ON owned_dep.objid = c.oid
-       AND owned_dep.classid = 'pg_class'::regclass
-       AND owned_dep.refclassid = 'pg_class'::regclass
-       AND owned_dep.deptype IN ('a', 'i')
-      LEFT JOIN pg_class owned_table ON owned_table.oid = owned_dep.refobjid
-      LEFT JOIN pg_namespace owned_ns ON owned_ns.oid = owned_table.relnamespace
-      LEFT JOIN pg_depend default_dep
-        ON default_dep.refobjid = c.oid
-       AND default_dep.classid = 'pg_attrdef'::regclass
-      LEFT JOIN pg_attrdef attr_default ON attr_default.oid = default_dep.objid
-      LEFT JOIN pg_class default_table ON default_table.oid = attr_default.adrelid
-      LEFT JOIN pg_namespace default_ns ON default_ns.oid = default_table.relnamespace
-      WHERE c.relkind = 'S'
-        AND n.nspname <> 'information_schema'
-        AND n.nspname !~ '^pg_'
+    // 4. Classify sequences before creating tables. Serial/default-backed
+    //    sequences must exist before a DEFAULT nextval(...) expression is
+    //    parsed. Identity sequences are deliberately not pre-created: the
+    //    identity clause creates and internally owns those sequences.
+    const sequences = await src.query<SourceSequenceDefinition>(`
+      SELECT
+        sequence_ns.nspname AS schema,
+        sequence_class.relname AS name,
+        pg_catalog.format_type(sequence_catalog.seqtypid, NULL) AS data_type,
+        sequence_catalog.seqstart::text AS start_value,
+        sequence_catalog.seqincrement::text AS increment_by,
+        sequence_catalog.seqmin::text AS min_value,
+        sequence_catalog.seqmax::text AS max_value,
+        sequence_catalog.seqcache::text AS cache_size,
+        sequence_catalog.seqcycle AS cycles,
+        owner_ns.nspname AS owner_schema,
+        owner_table.relname AS owner_table,
+        owner_attribute.attname AS owner_column,
+        owner_dependency.deptype AS dependency_type,
+        COALESCE(
+          (
+            SELECT json_agg(
+              default_reference
+              ORDER BY default_reference.schema,
+                       default_reference.table,
+                       default_reference.column
+            )
+            FROM (
+              SELECT DISTINCT
+                default_ns.nspname AS schema,
+                default_table.relname AS table,
+                default_attribute.attname AS column
+              FROM pg_depend default_dependency
+              JOIN pg_attrdef attribute_default
+                ON attribute_default.oid = default_dependency.objid
+              JOIN pg_class default_table
+                ON default_table.oid = attribute_default.adrelid
+              JOIN pg_namespace default_ns
+                ON default_ns.oid = default_table.relnamespace
+              JOIN pg_attribute default_attribute
+                ON default_attribute.attrelid = attribute_default.adrelid
+               AND default_attribute.attnum = attribute_default.adnum
+              WHERE default_dependency.classid = 'pg_attrdef'::regclass
+                AND default_dependency.refclassid = 'pg_class'::regclass
+                AND default_dependency.refobjid = sequence_class.oid
+                AND default_dependency.deptype = 'n'
+            ) default_reference
+          ),
+          '[]'::json
+        ) AS default_references
+      FROM pg_class sequence_class
+      JOIN pg_namespace sequence_ns
+        ON sequence_ns.oid = sequence_class.relnamespace
+      JOIN pg_sequence sequence_catalog
+        ON sequence_catalog.seqrelid = sequence_class.oid
+      LEFT JOIN LATERAL (
+        SELECT dependency.refobjid, dependency.refobjsubid, dependency.deptype
+        FROM pg_depend dependency
+        WHERE dependency.classid = 'pg_class'::regclass
+          AND dependency.objid = sequence_class.oid
+          AND dependency.objsubid = 0
+          AND dependency.refclassid = 'pg_class'::regclass
+          AND dependency.deptype IN ('a', 'i')
+        ORDER BY CASE dependency.deptype WHEN 'i' THEN 0 ELSE 1 END
+        LIMIT 1
+      ) owner_dependency ON true
+      LEFT JOIN pg_class owner_table
+        ON owner_table.oid = owner_dependency.refobjid
+      LEFT JOIN pg_namespace owner_ns
+        ON owner_ns.oid = owner_table.relnamespace
+      LEFT JOIN pg_attribute owner_attribute
+        ON owner_attribute.attrelid = owner_dependency.refobjid
+       AND owner_attribute.attnum = owner_dependency.refobjsubid
+      WHERE sequence_class.relkind = 'S'
+        AND sequence_ns.nspname <> 'information_schema'
+        AND sequence_ns.nspname !~ '^pg_'
         AND NOT EXISTS (
-          SELECT 1 FROM pg_depend d
-          WHERE d.objid = c.oid AND d.deptype = 'e'
+          SELECT 1
+          FROM pg_depend extension_dependency
+          WHERE extension_dependency.classid = 'pg_class'::regclass
+            AND extension_dependency.objid = sequence_class.oid
+            AND extension_dependency.deptype = 'e'
         )
-      ORDER BY c.relname
+      ORDER BY sequence_ns.nspname, sequence_class.relname
     `);
     const sequencesToCopy = selectedTableNames
       ? sequences.rows.filter(
-          (sequence) =>
-            sequence.owner_schema &&
-            sequence.owner_table &&
-            selectedTableNames.has(
-              `${sequence.owner_schema}.${sequence.owner_table}`,
-            ),
+          (sequence) => {
+            const relatedTables = [
+              ...(sequence.owner_schema && sequence.owner_table
+                ? [`${sequence.owner_schema}.${sequence.owner_table}`]
+                : []),
+              ...(sequence.default_references ?? []).map(
+                (reference) => `${reference.schema}.${reference.table}`,
+              ),
+            ];
+            return relatedTables.some((table) => selectedTableNames.has(table));
+          },
         )
       : sequences.rows;
-    for (const s of sequencesToCopy) {
+    const identitySequencesByColumn = new Map(
+      sequencesToCopy
+        .filter(
+          (sequence) =>
+            sequence.dependency_type === "i" &&
+            sequence.owner_schema &&
+            sequence.owner_table &&
+            sequence.owner_column,
+        )
+        .map((sequence) => [
+          `${sequence.owner_schema}\0${sequence.owner_table}\0${sequence.owner_column}`,
+          sequence,
+        ]),
+    );
+    for (const sequence of sequencesToCopy) {
+      if (sequence.dependency_type === "i") continue;
+      const qualifiedName = qualifiedIdentifier(
+        sequence.schema,
+        sequence.name,
+      );
+      const ddl =
+        `CREATE SEQUENCE IF NOT EXISTS ${qualifiedName} ` +
+        `AS ${sequence.data_type} ${sequenceOptions(sequence)}`;
       try {
-        await tgt.query(
-          `CREATE SEQUENCE IF NOT EXISTS "${s.schema}"."${s.seq}"`,
-        );
+        await tgt.query(ddl);
       } catch (err) {
         report.tablesFailed.push({
-          name: `${s.schema}.${s.seq} (sequence)`,
+          name: `${sequence.schema}.${sequence.name} (sequence)`,
           error: err instanceof Error ? err.message : String(err),
-          ddl: `CREATE SEQUENCE "${s.schema}"."${s.seq}"`,
+          ddl,
           code:
             err && typeof err === "object"
               ? (err as PostgresErrorLike).code
@@ -884,6 +1007,7 @@ async function copySchemaIfNeeded(
         formatted_type: string;
         attnotnull: boolean;
         attgenerated: "" | "s" | "v";
+        attidentity: "" | "a" | "d";
         column_default: string | null;
       }>(
         `SELECT
@@ -891,6 +1015,7 @@ async function copySchemaIfNeeded(
            pg_catalog.format_type(a.atttypid, a.atttypmod) AS formatted_type,
            a.attnotnull,
            a.attgenerated,
+           a.attidentity,
            pg_get_expr(ad.adbin, ad.adrelid) AS column_default
          FROM pg_attribute a
          LEFT JOIN pg_attrdef ad
@@ -931,6 +1056,21 @@ async function copySchemaIfNeeded(
               const persistence =
                 column.attgenerated === "v" ? "VIRTUAL" : "STORED";
               value = ` GENERATED ALWAYS AS (${column.column_default}) ${persistence}`;
+            } else if (column.attidentity !== "") {
+              const identitySequence = identitySequencesByColumn.get(
+                `${t.schema}\0${t.table}\0${column.attname}`,
+              );
+              if (!identitySequence) {
+                throw new Error(
+                  `Identity sequence metadata not found for ${t.schema}.${t.table}.${column.attname}.`,
+                );
+              }
+              const generation =
+                column.attidentity === "a" ? "ALWAYS" : "BY DEFAULT";
+              value =
+                ` GENERATED ${generation} AS IDENTITY (` +
+                `SEQUENCE NAME ${qualifiedIdentifier(identitySequence.schema, identitySequence.name)} ` +
+                `${sequenceOptions(identitySequence)})`;
             } else if (column.column_default) {
               value = ` DEFAULT ${column.column_default}`;
             }
@@ -952,6 +1092,37 @@ async function copySchemaIfNeeded(
           ddl:
             ddl ||
             `CREATE TABLE ${quoteIdent(t.schema)}.${quoteIdent(t.table)} (...)`,
+          code:
+            err && typeof err === "object"
+              ? (err as PostgresErrorLike).code
+              : undefined,
+        });
+      }
+    }
+
+    // Serial sequences are created without ownership because their tables do
+    // not exist yet. Restore OWNED BY after table creation so
+    // pg_get_serial_sequence(), DROP TABLE, and cutover discovery behave like
+    // the source. Explicitly shared/unowned nextval() sequences stay unowned.
+    for (const sequence of sequencesToCopy) {
+      if (
+        sequence.dependency_type !== "a" ||
+        !sequence.owner_schema ||
+        !sequence.owner_table ||
+        !sequence.owner_column
+      ) {
+        continue;
+      }
+      const ddl =
+        `ALTER SEQUENCE ${qualifiedIdentifier(sequence.schema, sequence.name)} ` +
+        `OWNED BY ${qualifiedIdentifier(sequence.owner_schema, sequence.owner_table)}.${quoteIdent(sequence.owner_column)}`;
+      try {
+        await tgt.query(ddl);
+      } catch (err) {
+        report.tablesFailed.push({
+          name: `${sequence.schema}.${sequence.name} (sequence ownership)`,
+          error: err instanceof Error ? err.message : String(err),
+          ddl,
           code:
             err && typeof err === "object"
               ? (err as PostgresErrorLike).code
