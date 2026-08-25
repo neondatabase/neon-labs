@@ -475,6 +475,13 @@ interface SourceSequenceDefinition {
   default_references: SequenceColumnReference[];
 }
 
+interface UnresolvedSequenceDefault {
+  schema: string;
+  table: string;
+  column: string;
+  expression: string;
+}
+
 function sequenceInteger(value: string, field: string): string {
   if (!/^-?\d+$/.test(value)) {
     throw new Error(`Invalid ${field} returned by PostgreSQL: ${value}`);
@@ -1477,6 +1484,97 @@ export async function copySchemaIfNeeded(
     //    sequences must exist before a DEFAULT nextval(...) expression is
     //    parsed. Identity sequences are deliberately not pre-created: the
     //    identity clause creates and internally owns those sequences.
+    const unresolvedSequenceDefaults =
+      await src.query<UnresolvedSequenceDefault>(
+        `WITH column_defaults AS (
+           SELECT
+             attribute_default.oid AS default_oid,
+             table_ns.nspname AS schema,
+             table_class.relname AS table,
+             table_attribute.attname AS column,
+             attribute_default.adbin::text AS expression_tree,
+             pg_get_expr(
+               attribute_default.adbin,
+               attribute_default.adrelid,
+               true
+             ) AS expression
+           FROM pg_attrdef attribute_default
+           JOIN pg_class table_class
+             ON table_class.oid = attribute_default.adrelid
+           JOIN pg_namespace table_ns
+             ON table_ns.oid = table_class.relnamespace
+           JOIN pg_attribute table_attribute
+             ON table_attribute.attrelid = attribute_default.adrelid
+            AND table_attribute.attnum = attribute_default.adnum
+           WHERE table_class.relkind = 'r'
+             AND table_ns.nspname <> 'information_schema'
+             AND table_ns.nspname !~ '^pg_'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM pg_depend extension_dependency
+               WHERE extension_dependency.classid = 'pg_class'::regclass
+                 AND extension_dependency.objid = table_class.oid
+                 AND extension_dependency.deptype = 'e'
+             )
+             AND (
+               $1::text[] IS NULL
+               OR (
+                 table_ns.nspname || '.' || table_class.relname
+               ) = ANY($1::text[])
+             )
+         ),
+         sequence_dependencies AS (
+           SELECT DISTINCT
+             default_dependency.objid AS default_oid
+           FROM pg_depend default_dependency
+           JOIN pg_class sequence_class
+             ON sequence_class.oid = default_dependency.refobjid
+            AND sequence_class.relkind = 'S'
+           WHERE default_dependency.classid = 'pg_attrdef'::regclass
+             AND default_dependency.refclassid = 'pg_class'::regclass
+             AND default_dependency.deptype = 'n'
+         )
+         SELECT
+           column_default.schema,
+           column_default.table,
+           column_default.column,
+           column_default.expression
+         FROM column_defaults column_default
+         CROSS JOIN LATERAL (
+           SELECT
+             ':funcid ' ||
+             'pg_catalog.nextval(regclass)'::regprocedure::oid::text ||
+             ' ' AS value
+         ) nextval_marker
+         LEFT JOIN sequence_dependencies
+           ON sequence_dependencies.default_oid = column_default.default_oid
+         WHERE position(
+           nextval_marker.value IN column_default.expression_tree
+         ) > 0
+           AND sequence_dependencies.default_oid IS NULL
+         ORDER BY
+           column_default.schema,
+           column_default.table,
+           column_default.column`,
+        [selectedTableNames ? [...selectedTableNames] : null],
+      );
+    if (unresolvedSequenceDefaults.rows.length > 0) {
+      for (const columnDefault of unresolvedSequenceDefaults.rows) {
+        report.tablesFailed.push({
+          name:
+            `${columnDefault.schema}.${columnDefault.table}.` +
+            `${columnDefault.column} (sequence default)`,
+          error:
+            "This default calls nextval() with a sequence name PostgreSQL " +
+            "cannot resolve as a catalog dependency. Use a schema-qualified " +
+            "regclass constant such as nextval('schema.sequence'::regclass) " +
+            "on the source before retrying.",
+          ddl: `DEFAULT ${columnDefault.expression}`,
+        });
+      }
+      return report;
+    }
+
     const sequences = await src.query<SourceSequenceDefinition>(`
       SELECT
         sequence_ns.nspname AS schema,
@@ -1745,13 +1843,26 @@ export async function copySchemaIfNeeded(
     // Serial sequences are created without ownership because their tables do
     // not exist yet. Restore OWNED BY after table creation so
     // pg_get_serial_sequence(), DROP TABLE, and cutover discovery behave like
-    // the source. Explicitly shared/unowned nextval() sequences stay unowned.
+    // the source. A sequence copied through a selected table's default can be
+    // owned by an excluded table; leave it unowned instead of referencing a
+    // relation that was intentionally not copied.
+    const tablesAvailableForOwnership = new Set([
+      ...report.tablesCreated,
+      ...report.tablesSkipped,
+    ]);
     for (const sequence of sequencesToCopy) {
       if (
         sequence.dependency_type !== "a" ||
         !sequence.owner_schema ||
         !sequence.owner_table ||
         !sequence.owner_column
+      ) {
+        continue;
+      }
+      if (
+        !tablesAvailableForOwnership.has(
+          `${sequence.owner_schema}.${sequence.owner_table}`,
+        )
       ) {
         continue;
       }
