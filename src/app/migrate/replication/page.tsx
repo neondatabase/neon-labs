@@ -2003,7 +2003,7 @@ function MigrationProgress({
               >
                 <span
                   aria-hidden
-                  className={`relative z-10 size-[11px] rounded-[1px] border transition-[transform,opacity,border-color,background-color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${markerClass} ${
+                  className={`relative size-[11px] rounded-[1px] border transition-[transform,opacity,border-color,background-color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${markerClass} ${
                     isCurrent ? "scale-110" : "scale-100"
                   }`}
                 />
