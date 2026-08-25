@@ -654,7 +654,7 @@ export async function copySchemaIfNeeded(
       `SELECT
          n.nspname AS schema,
          t.typname AS type,
-         array_agg(e.enumlabel ORDER BY e.enumsortorder) AS labels
+         json_agg(e.enumlabel::text ORDER BY e.enumsortorder) AS labels
        FROM pg_type t
        JOIN pg_namespace n ON n.oid = t.typnamespace
        JOIN pg_enum e ON e.enumtypid = t.oid
