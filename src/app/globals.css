@@ -213,6 +213,24 @@ body {
   animation: replication-indeterminate 1.5s linear infinite;
 }
 
+/* Neon UI's quiet provisioning vocabulary: only the in-flight status dot
+   breathes, while surrounding layout and labels remain stable. */
+.migration-status-breathe {
+  animation: migration-status-breathe 2.8s ease-in-out infinite;
+}
+
+@keyframes migration-status-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
 @keyframes replication-indeterminate {
   from {
     transform: translateX(-100%);
@@ -234,5 +252,10 @@ body {
 
   .replication-indeterminate-bar {
     transform: translateX(100%);
+  }
+
+  .migration-status-breathe {
+    opacity: 1;
+    transform: none;
   }
 }

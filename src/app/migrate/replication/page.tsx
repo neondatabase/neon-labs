@@ -78,6 +78,23 @@ type Phase =
   | "analyzing-target"
   | "tearing-down";
 
+const MIGRATION_STEPS = [
+  "Preflight",
+  "Enable logical replication",
+  "Provision replication",
+  "Live replication",
+  "Analyze target",
+  "Cutover",
+] as const;
+
+type MigrationStepState = "completed" | "current" | "blocked" | "upcoming";
+type MigrationQuietStatusState =
+  | "ready"
+  | "provisioning"
+  | "error"
+  | "stopped"
+  | "warning";
+
 export default function ReplicationPage() {
   const { assessment } = useAssessment();
   const [cfg, setCfg] = useState<NeonConfig | null>(null);
@@ -718,8 +735,9 @@ export default function ReplicationPage() {
 
   const pickerRow = (
     <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-[4px] border border-[#262727] bg-[#131414] px-4 py-3">
-      <div className="flex flex-wrap items-center gap-3 text-caption">
+      <div className="flex w-full flex-col items-stretch gap-3 text-caption sm:flex-row sm:flex-wrap sm:items-center">
         <TargetProjectPicker
+          className="min-w-0 flex-wrap sm:w-auto sm:flex-nowrap"
           role="source"
           targetPgVersion={assessment?.sourceVersion ?? 14}
           onChange={(t) => {
@@ -740,8 +758,14 @@ export default function ReplicationPage() {
             setPhase("idle");
           }}
         />
-        <span className="text-[#00e599]">→</span>
+        <span
+          aria-hidden
+          className="self-center text-[#00e599] max-sm:rotate-90"
+        >
+          →
+        </span>
         <TargetProjectPicker
+          className="min-w-0 flex-wrap sm:w-auto sm:flex-nowrap"
           role="target"
           targetPgVersion={assessment?.targetVersion ?? 17}
           onChange={(t) => {
@@ -760,7 +784,6 @@ export default function ReplicationPage() {
           }}
         />
       </div>
-      <span className="text-label text-[#9ca3af]">Phase: {phase}</span>
     </div>
   );
 
@@ -778,6 +801,36 @@ export default function ReplicationPage() {
     </Notice>
   );
 
+  const setupRecoveryComplete = Boolean(
+    !setup &&
+      !cutoverResult &&
+      teardownResult?.cleanupComplete &&
+      teardownResult.before.anyResourceExists &&
+      teardownResult.before.subscription.state === "absent",
+  );
+  const setupRecoveryActive = Boolean(
+    !setup &&
+      !cutoverResult &&
+      !setupRecoveryComplete &&
+      teardownInspection?.anyResourceExists &&
+      teardownInspection.subscription.state === "absent",
+  );
+  const progressTracker = (
+    <MigrationProgress
+      phase={phase}
+      preflight={preflight}
+      setup={setup}
+      status={status}
+      analyzeResult={analyzeResult}
+      cutoverPre={cutoverPre}
+      cutoverResult={cutoverResult}
+      teardownInspection={teardownInspection}
+      teardownResult={teardownResult}
+      setupRecoveryActive={setupRecoveryActive}
+      setupRecoveryComplete={setupRecoveryComplete}
+    />
+  );
+
   if (!sourceReady || !targetReady) {
     return (
       <div className={neon.page}>
@@ -787,8 +840,9 @@ export default function ReplicationPage() {
             subtitle="One-click logical replication setup between your source and target Neon projects"
             actions={authAction}
           />
-          {pickerRow}
           {workloadNotice}
+          {pickerRow}
+          {progressTracker}
           <Notice tone="warning">
             <NoticeIcon>
               <AlertTriangle />
@@ -822,8 +876,9 @@ export default function ReplicationPage() {
           actions={authAction}
         />
 
-        {pickerRow}
         {workloadNotice}
+        {pickerRow}
+        {progressTracker}
 
         {/* Brief overview, collapsible. Lands users oriented without
             forcing them to read a wall of text before they can act. */}
@@ -1358,24 +1413,20 @@ export default function ReplicationPage() {
           <div id="replication-teardown">
             <Section
               eyebrow={
-                !setup &&
-                !cutoverResult &&
-                teardownInspection?.subscription.state === "absent"
+                setupRecoveryActive || setupRecoveryComplete
                   ? "Recovery"
                   : "Cleanup"
               }
               title={
-                !setup &&
-                !cutoverResult &&
-                teardownInspection?.subscription.state === "absent"
+                setupRecoveryActive || setupRecoveryComplete
                   ? "Setup recovery"
                   : "Replication teardown"
               }
               subtitle={
-                !setup &&
-                !cutoverResult &&
-                teardownInspection?.subscription.state === "absent"
+                setupRecoveryActive
                   ? "Remove partial resources from an earlier setup attempt before retrying"
+                  : setupRecoveryComplete
+                    ? "Recovery complete. Replication setup is ready to retry"
                   : "Inspect and remove only the replication resources created by this application"
               }
               danger
@@ -1399,11 +1450,7 @@ export default function ReplicationPage() {
                   busy={phase === "tearing-down"}
                   checking={teardownInspecting}
                   recheckAttempts={teardownRecheckAttempts}
-                  setupRecovery={
-                    !setup &&
-                    !cutoverResult &&
-                    teardownInspection.subscription.state === "absent"
-                  }
+                  setupRecovery={setupRecoveryActive || setupRecoveryComplete}
                   sourceProjectId={sourceProjectId}
                   inspectionSqlCopied={
                     copiedSql === "active-slot-inspection"
@@ -1435,6 +1482,413 @@ export default function ReplicationPage() {
 
       </div>
     </div>
+  );
+}
+
+function MigrationQuietStatus({
+  state,
+  label,
+}: {
+  state: MigrationQuietStatusState;
+  label: string;
+}) {
+  const dotColor = {
+    ready: "bg-[#00e599]",
+    provisioning: "bg-[#00e599]",
+    error: "bg-[#ef4444]",
+    stopped: "bg-[#6b7280]",
+    warning: "bg-[#f59e0b]",
+  }[state];
+
+  return (
+    <span className="inline-flex items-center gap-1.5 font-mono text-label text-[#9ca3af]">
+      <span
+        aria-hidden
+        className={`size-1.5 shrink-0 rounded-[1px] ${dotColor} ${
+          state === "provisioning" ? "migration-status-breathe" : ""
+        }`}
+      />
+      {label}
+    </span>
+  );
+}
+
+function MigrationProgress({
+  phase,
+  preflight,
+  setup,
+  status,
+  analyzeResult,
+  cutoverPre,
+  cutoverResult,
+  teardownInspection,
+  teardownResult,
+  setupRecoveryActive,
+  setupRecoveryComplete,
+}: {
+  phase: Phase;
+  preflight: ReplicationPreflight | null;
+  setup: ReplicationSetupResult | null;
+  status: ReplicationStatus | null;
+  analyzeResult: AnalyzeTargetResult | null;
+  cutoverPre: CutoverPreflight | null;
+  cutoverResult: CutoverResult | null;
+  teardownInspection: ReplicationResourceInspection | null;
+  teardownResult: ReplicationTeardownResult | null;
+  setupRecoveryActive: boolean;
+  setupRecoveryComplete: boolean;
+}) {
+  const analyzeSucceeded = analyzeResult?.missingStatsAfter === 0;
+  const cutoverStarted =
+    phase === "cutover-preflight" ||
+    phase === "cutover-ready" ||
+    phase === "cutting-over" ||
+    cutoverPre !== null ||
+    cutoverResult !== null;
+  const preflightHasNonEnablementBlocker = Boolean(
+    preflight &&
+      (!preflight.source.roleHasReplication ||
+        preflight.source.tableCount === 0),
+  );
+
+  let currentStep = 1;
+  let blocked = false;
+  let summary = "Ready to run preflight";
+  let detail: string | null = null;
+  let summaryStatus: MigrationQuietStatusState = "ready";
+  let summaryStatusLabel = "Current";
+
+  if (cutoverResult) {
+    currentStep = 6;
+    summary = "Cutover complete";
+    detail = "Traffic can move to the target";
+    summaryStatusLabel = "Complete";
+  } else if (setupRecoveryActive || setupRecoveryComplete) {
+    currentStep = 3;
+    blocked = setupRecoveryActive;
+    summary = setupRecoveryActive ? "Setup recovery" : "Ready to retry";
+    detail =
+      setupRecoveryActive && phase === "tearing-down"
+        ? "Removing partial resources before provisioning"
+        : setupRecoveryActive
+          ? "Partial resources must be removed before provisioning"
+          : "Recovery complete · Provisioning can be started again";
+    summaryStatus =
+      setupRecoveryActive && phase === "tearing-down"
+        ? "provisioning"
+        : setupRecoveryActive
+          ? "warning"
+          : "ready";
+    summaryStatusLabel =
+      setupRecoveryActive && phase === "tearing-down"
+        ? "In progress"
+        : setupRecoveryActive
+          ? "Needs attention"
+          : "Current";
+  } else if (!preflight || phase === "preflighting") {
+    currentStep = 1;
+    if (phase === "preflighting") {
+      summary = "Checking source and target";
+      summaryStatus = "provisioning";
+      summaryStatusLabel = "In progress";
+    }
+  } else if (!preflight.source.logicalReplicationEnabled) {
+    currentStep = 2;
+    blocked = preflightHasNonEnablementBlocker;
+    summary =
+      phase === "enabling"
+        ? "Enabling logical replication"
+        : blocked
+          ? "Preflight needs attention"
+          : "Logical replication is disabled";
+    detail = blocked
+      ? "Resolve the remaining preflight blockers before provisioning"
+      : "Enable it on the source to continue";
+    summaryStatus =
+      phase === "enabling" ? "provisioning" : blocked ? "error" : "warning";
+    summaryStatusLabel =
+      phase === "enabling"
+        ? "In progress"
+        : blocked
+          ? "Needs attention"
+          : "Action required";
+  } else if (!setup || phase === "setting-up") {
+    currentStep = 3;
+    blocked = !preflight.ok;
+    summary =
+      phase === "setting-up"
+        ? "Provisioning replication"
+        : blocked
+          ? "Preflight needs attention"
+          : "Ready to provision replication";
+    detail = blocked
+      ? "Resolve the preflight blockers before starting setup"
+      : "Publication and subscription are next";
+    summaryStatus =
+      phase === "setting-up" ? "provisioning" : blocked ? "error" : "ready";
+    summaryStatusLabel =
+      phase === "setting-up"
+        ? "In progress"
+        : blocked
+          ? "Needs attention"
+          : "Current";
+  } else if (status?.state !== "streaming" && !cutoverStarted) {
+    currentStep = 4;
+    blocked = status?.state === "stopped" || status?.state === "unknown";
+    if (status?.state === "copying") {
+      summary = "Initial copy in progress";
+      detail = `${status.readyTables} of ${status.totalTables} tables ready · ${
+        status.lagBytes === null ? "Lag unavailable" : `${formatBytes(status.lagBytes)} lag`
+      }`;
+      summaryStatus = "provisioning";
+      summaryStatusLabel = "In progress";
+    } else if (blocked) {
+      summary = "Replication needs attention";
+      detail = `Subscription state: ${status?.state ?? "unknown"}`;
+      summaryStatus = status?.state === "stopped" ? "stopped" : "error";
+      summaryStatusLabel = "Needs attention";
+    } else {
+      summary = "Waiting for replication status";
+      detail = "The first status poll will report copy progress";
+      summaryStatus = "stopped";
+      summaryStatusLabel = "Waiting";
+    }
+  } else if (!analyzeSucceeded && !cutoverStarted) {
+    currentStep = 5;
+    blocked = Boolean(analyzeResult && !analyzeSucceeded);
+    summary =
+      phase === "analyzing-target"
+        ? "Analyzing target"
+        : blocked
+          ? "Target analysis needs attention"
+          : "Ready to analyze target";
+    detail = blocked
+      ? `${analyzeResult?.missingStatsAfter ?? 0} relation(s) still need statistics`
+      : "Rebuild optimizer statistics before cutover";
+    summaryStatus =
+      phase === "analyzing-target" ? "provisioning" : blocked ? "warning" : "ready";
+    summaryStatusLabel =
+      phase === "analyzing-target"
+        ? "In progress"
+        : blocked
+          ? "Needs attention"
+          : "Current";
+  } else {
+    currentStep = 6;
+    blocked = Boolean(cutoverPre && !cutoverPre.ok);
+    if (phase === "cutover-preflight") {
+      summary = "Checking cutover readiness";
+      summaryStatus = "provisioning";
+      summaryStatusLabel = "In progress";
+    } else if (phase === "cutting-over") {
+      summary = "Cutover in progress";
+      summaryStatus = "provisioning";
+      summaryStatusLabel = "In progress";
+    } else if (blocked) {
+      summary = "Cutover needs attention";
+      detail = `${cutoverPre?.blockers.length ?? 0} blocker(s) must be resolved`;
+      summaryStatus = "error";
+      summaryStatusLabel = "Needs attention";
+    } else if (cutoverPre?.ok) {
+      summary = "Ready to cut over";
+      detail = "Preflight checks passed";
+    } else {
+      summary = "Ready for cutover preflight";
+      detail = "Check lag, row counts, sequences, and slot activity";
+    }
+  }
+
+  const allCompleted = Boolean(cutoverResult);
+  const stepStates = MIGRATION_STEPS.map<MigrationStepState>((_, index) => {
+    const step = index + 1;
+    if (allCompleted || step < currentStep) return "completed";
+    if (step === currentStep) return blocked ? "blocked" : "current";
+    return "upcoming";
+  });
+
+  const cleanupState = (() => {
+    if (setupRecoveryActive || setupRecoveryComplete) return null;
+    if (phase === "tearing-down") {
+      return {
+        state: "provisioning" as const,
+        label: "Tearing down",
+        detail: "Removing application-owned replication resources",
+      };
+    }
+    if (teardownResult && !teardownResult.cleanupComplete) {
+      return {
+        state: "error" as const,
+        label: "Needs attention",
+        detail: "Cleanup is incomplete. Review the remaining resources below",
+      };
+    }
+    if (teardownResult?.cleanupComplete) {
+      return {
+        state: "ready" as const,
+        label: "Cleanup complete",
+        detail: "No application-owned replication resources remain",
+      };
+    }
+    if (cutoverResult) {
+      return {
+        state: "warning" as const,
+        label: "Rollback window",
+        detail:
+          "Keep the source and replication resources available for 24–48 hours before teardown",
+      };
+    }
+    if (setup || teardownInspection?.anyResourceExists) {
+      return {
+        state: "stopped" as const,
+        label: "Cleanup available",
+        detail: "Teardown remains separate from the six migration steps",
+      };
+    }
+    return null;
+  })();
+
+  return (
+    <nav
+      aria-label="Migration progress"
+      className="mb-5 rounded-[4px] border border-[#262727] bg-[#131414] px-4 py-4 sm:px-5"
+    >
+      <div
+        aria-live="polite"
+        className="flex flex-wrap items-start justify-between gap-2"
+      >
+        <div>
+          <p className="font-mono text-caption text-foreground">
+            Step {currentStep} of {MIGRATION_STEPS.length}
+            <span className="text-[#6b7280]"> · </span>
+            {summary}
+          </p>
+          {detail ? (
+            <p className="mt-1 font-mono text-label tabular-nums text-[#9ca3af]">
+              {detail}
+            </p>
+          ) : null}
+        </div>
+        <MigrationQuietStatus
+          label={summaryStatusLabel}
+          state={summaryStatus}
+        />
+      </div>
+
+      <div className="relative mt-5">
+        <span
+          aria-hidden
+          className="absolute left-[8.333%] right-[8.333%] top-[5px] h-px bg-[#262727]"
+        />
+        <ol className="relative grid grid-cols-6">
+          {MIGRATION_STEPS.map((label, index) => {
+            const state = stepStates[index];
+            const isCurrent = index + 1 === currentStep;
+            const markerClass = {
+              completed: "border-[#00e599] bg-[#00e599]",
+              current: "border-[#00e599] bg-[#131414] shadow-[0_0_0_3px_rgba(0,229,153,0.10)]",
+              blocked: "border-[#f59e0b] bg-[#f59e0b]",
+              upcoming: "border-[#4b4d4d] bg-[#131414]",
+            }[state];
+            const labelClass = {
+              completed: "text-[#9ca3af]",
+              current: "font-medium text-foreground",
+              blocked: "font-medium text-foreground",
+              upcoming: "text-[#6b7280]",
+            }[state];
+
+            return (
+              <li
+                aria-current={isCurrent ? "step" : undefined}
+                className="relative flex min-w-0 flex-col items-center px-0.5 text-center"
+                key={label}
+              >
+                <span
+                  aria-hidden
+                  className={`relative z-10 size-[11px] rounded-[1px] border transition-[transform,opacity,border-color,background-color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${markerClass} ${
+                    isCurrent ? "scale-110" : "scale-100"
+                  }`}
+                />
+                <span
+                  className={`mt-2 text-label leading-[1.35] transition-[color,opacity] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                    isCurrent ? "block" : "hidden sm:block"
+                  } ${labelClass}`}
+                >
+                  {label}
+                </span>
+                <span className="sr-only sm:not-sr-only sm:mt-1">
+                  <MigrationQuietStatus
+                    label={
+                      state === "completed"
+                        ? "Complete"
+                        : state === "blocked"
+                          ? "Needs attention"
+                          : state === "current"
+                            ? "Current"
+                            : "Upcoming"
+                    }
+                    state={
+                      state === "completed" || state === "current"
+                        ? "ready"
+                        : state === "blocked"
+                          ? "warning"
+                          : "stopped"
+                    }
+                  />
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+      </div>
+
+      {setupRecoveryActive || setupRecoveryComplete ? (
+        <div className="mt-4 flex items-start justify-between gap-3 border-t border-[#262727] pt-3">
+          <div>
+            <p className="text-caption font-medium text-foreground">
+              Setup recovery
+            </p>
+            <p className="mt-0.5 text-label text-[#9ca3af]">
+              {setupRecoveryComplete
+                ? "Complete · Step 3 is ready to retry"
+                : "Required · Complete the cleanup steps below before retrying"}
+            </p>
+          </div>
+          <MigrationQuietStatus
+            label={
+              setupRecoveryComplete
+                ? "Complete"
+                : phase === "tearing-down"
+                  ? "Cleaning up"
+                  : "Needs attention"
+            }
+            state={
+              setupRecoveryComplete
+                ? "ready"
+                : phase === "tearing-down"
+                  ? "provisioning"
+                  : "warning"
+            }
+          />
+        </div>
+      ) : null}
+
+      {cleanupState ? (
+        <div className="mt-4 flex flex-wrap items-start justify-between gap-3 border-t border-[#262727] pt-3">
+          <div>
+            <p className="text-caption font-medium text-foreground">
+              Replication cleanup
+            </p>
+            <p className="mt-0.5 max-w-2xl text-label leading-[1.5] text-[#9ca3af]">
+              {cleanupState.detail}
+            </p>
+          </div>
+          <MigrationQuietStatus
+            label={cleanupState.label}
+            state={cleanupState.state}
+          />
+        </div>
+      ) : null}
+    </nav>
   );
 }
 
@@ -2338,7 +2792,9 @@ WHERE pid = ${inspection.slot.activePid};`
             }`}
           >
             {result.cleanupComplete
-              ? "Teardown verified. No application-owned replication resources remain."
+              ? setupRecovery
+                ? "Setup recovery complete. No partial resources remain; Step 3 is ready to retry."
+                : "Teardown verified. No application-owned replication resources remain."
               : result.replicationStopped
                 ? `Replication subscription removed. Source cleanup is incomplete. Remaining resources: ${result.remainingResources.join(", ")}.`
                 : `Replication is not stopped. Remaining resources: ${result.remainingResources.join(", ")}.`}
