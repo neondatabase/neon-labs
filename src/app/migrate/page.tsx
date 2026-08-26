@@ -15,6 +15,7 @@ const PATHS: Record<
     sizeRange: string;
     downtime: string;
     when: string;
+    consoleInstruction?: string;
     pros: string[];
     cons: string[];
     docsUrl: string;
@@ -26,6 +27,8 @@ const PATHS: Record<
     downtime: "Minutes",
     when:
       "Small databases where you can tolerate a brief read/write pause during the import.",
+    consoleInstruction:
+      "In Neon Console, click the data import button on the Projects page to continue.",
     pros: [
       "Runs entirely on Neon infrastructure",
       "No CLI / tooling required",
@@ -114,11 +117,14 @@ export default function MigratePage() {
           {ORDER.map((id, i) => {
             const p = PATHS[id];
             const isRecommended = id === recommendedPath;
+            const isConsoleHandoff = id === "import-assistant";
             return (
               <Link
                 key={id}
                 href={UPGRADE_PATH_ROUTES[id]}
+                rel={isConsoleHandoff ? "noreferrer" : undefined}
                 style={{ "--enter-delay": `${i * 60}ms` } as React.CSSProperties}
+                target={isConsoleHandoff ? "_blank" : undefined}
                 className={`enter-rise group flex flex-col rounded-[4px] border p-5 transition-[background-color,border-color,transform] duration-150 ease-out active:scale-[0.99] ${neon.focusRing} ${
                   isRecommended
                     ? "border-primary/40 bg-primary/[0.04] hover:border-primary/60"
@@ -131,6 +137,11 @@ export default function MigratePage() {
                 <p className="text-body font-medium text-foreground">
                   {p.label}
                 </p>
+                {isConsoleHandoff && (
+                  <p className={`mt-1 text-label ${neon.muted}`}>
+                    Runs entirely in Neon Console.
+                  </p>
+                )}
                 <div className="mt-3 flex gap-3 text-label">
                   <span className="font-mono text-foreground">
                     {p.sizeRange}
@@ -166,11 +177,20 @@ export default function MigratePage() {
                 <p className={`mt-4 text-caption leading-[1.6] ${neon.muted}`}>
                   {p.when}
                 </p>
+                {p.consoleInstruction && (
+                  <p className={`mt-2 text-caption leading-[1.6] ${neon.muted}`}>
+                    {p.consoleInstruction}
+                  </p>
+                )}
 
                 <div className="mt-auto flex items-center justify-between gap-3 pt-4">
                   <span className="inline-flex items-center gap-1 text-caption font-medium text-primary">
-                    Start
-                    <ArrowRight className="h-3 w-3" />
+                    {isConsoleHandoff ? "Open Neon Console" : "Start"}
+                    {isConsoleHandoff ? (
+                      <ExternalLink className="h-3 w-3" />
+                    ) : (
+                      <ArrowRight className="h-3 w-3" />
+                    )}
                   </span>
                   <span
                     role="link"

@@ -4,7 +4,7 @@
      1. Verify no replication lag
      2. Verify all per-table subscription state = streaming
      3. Detect sequence drift (source.last_value vs target.last_value)
-     4. Reset target sequences to (source.last_value + safety_margin)
+     4. Synchronize target serial and identity sequence state
      5. Verify row counts match per table
      6. Disable subscription so target stops trying to pull from source
      7. Surface the target connection string as the new primary
@@ -24,6 +24,279 @@ const DEFAULT_SUB = "neon_advisor_sub";
 
 function unpool(conn: string): string {
   return conn.replace(/-pooler/g, "");
+}
+
+function quoteIdent(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function qualifiedIdentifier(schema: string, name: string): string {
+  return `${quoteIdent(schema)}.${quoteIdent(name)}`;
+}
+
+function relationKey(schema: string, table: string): string {
+  return `${schema}\0${table}`;
+}
+
+interface SequenceColumnRelation {
+  sequence_schema: string;
+  sequence_name: string;
+  table_schema: string;
+  table_name: string;
+  column_name: string;
+  increment_by: string;
+}
+
+interface SequenceState {
+  lastValue: bigint;
+  isCalled: boolean;
+}
+
+interface SequenceBoundary {
+  value: bigint | null;
+  hasRows: boolean;
+}
+
+async function loadSequenceColumnRelations(
+  client: Client,
+): Promise<SequenceColumnRelation[]> {
+  const result = await client.query<SequenceColumnRelation>(`
+    WITH sequence_column_dependencies AS (
+      SELECT
+        dependency.objid AS sequence_oid,
+        dependency.refobjid AS table_oid,
+        dependency.refobjsubid AS column_number
+      FROM pg_depend dependency
+      JOIN pg_class sequence_class
+        ON sequence_class.oid = dependency.objid
+       AND sequence_class.relkind = 'S'
+      WHERE dependency.classid = 'pg_class'::regclass
+        AND dependency.objsubid = 0
+        AND dependency.refclassid = 'pg_class'::regclass
+        AND dependency.deptype IN ('a', 'i')
+
+      UNION
+
+      SELECT
+        dependency.refobjid AS sequence_oid,
+        attribute_default.adrelid AS table_oid,
+        attribute_default.adnum AS column_number
+      FROM pg_depend dependency
+      JOIN pg_attrdef attribute_default
+        ON attribute_default.oid = dependency.objid
+      JOIN pg_class sequence_class
+        ON sequence_class.oid = dependency.refobjid
+       AND sequence_class.relkind = 'S'
+      WHERE dependency.classid = 'pg_attrdef'::regclass
+        AND dependency.refclassid = 'pg_class'::regclass
+        AND dependency.deptype = 'n'
+    )
+    SELECT DISTINCT
+      sequence_ns.nspname AS sequence_schema,
+      sequence_class.relname AS sequence_name,
+      table_ns.nspname AS table_schema,
+      table_class.relname AS table_name,
+      table_attribute.attname AS column_name,
+      sequence_catalog.seqincrement::text AS increment_by
+    FROM sequence_column_dependencies dependency
+    JOIN pg_class sequence_class
+      ON sequence_class.oid = dependency.sequence_oid
+    JOIN pg_namespace sequence_ns
+      ON sequence_ns.oid = sequence_class.relnamespace
+    JOIN pg_sequence sequence_catalog
+      ON sequence_catalog.seqrelid = sequence_class.oid
+    JOIN pg_class table_class
+      ON table_class.oid = dependency.table_oid
+    JOIN pg_namespace table_ns
+      ON table_ns.oid = table_class.relnamespace
+    JOIN pg_attribute table_attribute
+      ON table_attribute.attrelid = dependency.table_oid
+     AND table_attribute.attnum = dependency.column_number
+    WHERE table_attribute.attnum > 0
+      AND NOT table_attribute.attisdropped
+      AND sequence_ns.nspname <> 'information_schema'
+      AND sequence_ns.nspname !~ '^pg_'
+      AND table_ns.nspname <> 'information_schema'
+      AND table_ns.nspname !~ '^pg_'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_depend extension_dependency
+        WHERE extension_dependency.classid = 'pg_class'::regclass
+          AND extension_dependency.objid = sequence_class.oid
+          AND extension_dependency.deptype = 'e'
+      )
+    ORDER BY
+      sequence_ns.nspname,
+      sequence_class.relname,
+      table_ns.nspname,
+      table_class.relname,
+      table_attribute.attname
+  `);
+  return result.rows;
+}
+
+async function readSequenceState(
+  client: Client,
+  schema: string,
+  sequence: string,
+): Promise<SequenceState> {
+  const result = await client.query<{ last_value: string; is_called: boolean }>(
+    `SELECT last_value::text AS last_value, is_called FROM ${qualifiedIdentifier(schema, sequence)}`,
+  );
+  return {
+    lastValue: BigInt(result.rows[0].last_value),
+    isCalled: result.rows[0].is_called,
+  };
+}
+
+async function readSequenceBoundary(
+  client: Client,
+  relations: SequenceColumnRelation[],
+  increment: bigint,
+): Promise<SequenceBoundary> {
+  let boundary: bigint | null = null;
+  let hasRows = false;
+  const aggregate = increment < BigInt(0) ? "MIN" : "MAX";
+  for (const relation of relations) {
+    const result = await client.query<{
+      boundary: string | null;
+      row_count: string;
+    }>(
+      `SELECT ${aggregate}(${quoteIdent(relation.column_name)})::text AS boundary, ` +
+        `count(*)::text AS row_count ` +
+        `FROM ${qualifiedIdentifier(relation.table_schema, relation.table_name)}`,
+    );
+    hasRows ||= BigInt(result.rows[0].row_count) > BigInt(0);
+    if (result.rows[0].boundary === null) continue;
+    const candidate = BigInt(result.rows[0].boundary);
+    if (
+      boundary === null ||
+      (increment < BigInt(0) ? candidate < boundary : candidate > boundary)
+    ) {
+      boundary = candidate;
+    }
+  }
+  return { value: boundary, hasRows };
+}
+
+function requiredSequenceValue(
+  sourceState: SequenceState,
+  boundary: bigint | null,
+  increment: bigint,
+): bigint {
+  if (boundary === null || !sourceState.isCalled) {
+    return boundary ?? sourceState.lastValue;
+  }
+  return increment < BigInt(0)
+    ? sourceState.lastValue < boundary
+      ? sourceState.lastValue
+      : boundary
+    : sourceState.lastValue > boundary
+      ? sourceState.lastValue
+      : boundary;
+}
+
+function displaySequenceNumber(value: bigint): number {
+  return Number(value);
+}
+
+function groupSequenceRelations(
+  relations: SequenceColumnRelation[],
+): Map<string, SequenceColumnRelation[]> {
+  const grouped = new Map<string, SequenceColumnRelation[]>();
+  for (const relation of relations) {
+    const key = relationKey(
+      relation.sequence_schema,
+      relation.sequence_name,
+    );
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.push(relation);
+    } else {
+      grouped.set(key, [relation]);
+    }
+  }
+  return grouped;
+}
+
+export async function synchronizeTargetSequences(
+  sourceConn: string,
+  targetConn: string,
+  tables: { schema: string; table: string }[],
+): Promise<SequenceDrift[]> {
+  const src = new Client({ connectionString: unpool(sourceConn) });
+  const tgt = new Client({ connectionString: unpool(targetConn) });
+  await Promise.all([src.connect(), tgt.connect()]);
+  try {
+    const tableKeys = new Set(
+      tables.map((table) => relationKey(table.schema, table.table)),
+    );
+    const sequenceRelations = (await loadSequenceColumnRelations(src)).filter(
+      (relation) =>
+        tableKeys.has(
+          relationKey(relation.table_schema, relation.table_name),
+        ),
+    );
+    const sequences = groupSequenceRelations(sequenceRelations);
+    const synchronized: SequenceDrift[] = [];
+
+    for (const relations of sequences.values()) {
+      const sequence = relations[0];
+      const increment = BigInt(sequence.increment_by);
+      const [sourceState, targetState, targetBoundary] = await Promise.all([
+        readSequenceState(
+          src,
+          sequence.sequence_schema,
+          sequence.sequence_name,
+        ),
+        readSequenceState(
+          tgt,
+          sequence.sequence_schema,
+          sequence.sequence_name,
+        ),
+        readSequenceBoundary(tgt, relations, increment),
+      ]);
+      const sourceRequired = requiredSequenceValue(
+        sourceState,
+        targetBoundary.value,
+        increment,
+      );
+      const desiredValue =
+        targetState.isCalled &&
+        (increment < BigInt(0)
+          ? targetState.lastValue < sourceRequired
+          : targetState.lastValue > sourceRequired)
+          ? targetState.lastValue
+          : sourceRequired;
+      const desiredIsCalled =
+        targetBoundary.hasRows ||
+        sourceState.isCalled ||
+        (desiredValue === targetState.lastValue && targetState.isCalled);
+      await tgt.query("SELECT setval($1::regclass, $2::bigint, $3)", [
+        qualifiedIdentifier(
+          sequence.sequence_schema,
+          sequence.sequence_name,
+        ),
+        desiredValue.toString(),
+        desiredIsCalled,
+      ]);
+      const relation = relations[0];
+      synchronized.push({
+        sequence: `${sequence.sequence_schema}.${sequence.sequence_name}`,
+        table: `${relation.table_schema}.${relation.table_name}`,
+        column: relation.column_name,
+        sourceLastValue: displaySequenceNumber(sourceRequired),
+        targetLastValue: displaySequenceNumber(targetState.lastValue),
+        driftBy: displaySequenceNumber(
+          sourceRequired - targetState.lastValue,
+        ),
+        recommendedTargetValue: displaySequenceNumber(desiredValue),
+      });
+    }
+    return synchronized;
+  } finally {
+    await Promise.all([src.end(), tgt.end()]);
+  }
 }
 
 /* ── Preflight ─────────────────────────────────────────────── */
@@ -93,8 +366,13 @@ export async function preflight(
       lagBytes = null;
     }
 
-    const perTable = await tgt.query<{ table: string; state: string }>(
-      `SELECT srrelid::regclass::text AS table,
+    const perTable = await tgt.query<{
+      schema: string;
+      table: string;
+      state: string;
+    }>(
+      `SELECT table_ns.nspname AS schema,
+              table_class.relname AS table,
               CASE srsubstate
                 WHEN 'i' THEN 'initializing'
                 WHEN 'd' THEN 'copying'
@@ -104,6 +382,8 @@ export async function preflight(
               END AS state
        FROM pg_subscription_rel sr
        JOIN pg_subscription s ON s.oid = sr.srsubid
+       JOIN pg_class table_class ON table_class.oid = sr.srrelid
+       JOIN pg_namespace table_ns ON table_ns.oid = table_class.relnamespace
        WHERE s.subname = $1`,
       [subName],
     );
@@ -112,89 +392,93 @@ export async function preflight(
     );
     const allStreaming = notStreaming.length === 0 && perTable.rows.length > 0;
 
-    // Sequence drift: for every sequence owned by a column, compare
-    //   max(owning_column) on source — the next id the app *would* produce
-    //   vs target sequence's last_value — what the target would generate
-    // If source's max > target's last_value, the next nextval() on target
-    // would collide. We always recommend bumping target past source's max
-    // + a safety margin.
-    const seqMeta = await src.query<{
-      seq: string;
-      tablename: string | null;
-      colname: string | null;
-    }>(`
-      SELECT n.nspname || '.' || c.relname AS seq,
-             ot.relname AS tablename,
-             oa.attname AS colname
-      FROM pg_class c
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-      LEFT JOIN pg_depend d ON d.objid = c.oid AND d.deptype IN ('a','i')
-      LEFT JOIN pg_class ot ON ot.oid = d.refobjid
-      LEFT JOIN pg_attribute oa
-        ON oa.attrelid = d.refobjid AND oa.attnum = d.refobjsubid
-      WHERE c.relkind = 'S' AND n.nspname = 'public'
-        AND NOT EXISTS (
-          SELECT 1 FROM pg_depend de WHERE de.objid = c.oid AND de.deptype = 'e'
-        )
-    `);
-
+    // Discover serial, identity, and explicit nextval() dependencies from the
+    // catalogs. Restrict the source inventory to tables actually attached to
+    // this target subscription, without assuming the public schema.
+    const replicatedTableKeys = new Set(
+      perTable.rows.map((table) => relationKey(table.schema, table.table)),
+    );
+    const sequenceRelations = (await loadSequenceColumnRelations(src)).filter(
+      (relation) =>
+        replicatedTableKeys.has(
+          relationKey(relation.table_schema, relation.table_name),
+        ),
+    );
+    const sequences = groupSequenceRelations(sequenceRelations);
     const drift: SequenceDrift[] = [];
-    const SAFETY = 1000;
-    for (const r of seqMeta.rows) {
-      // Source side: prefer max(column) if owner is known, else fall back to
-      // pg_sequences.last_value (which is fresh on source — only stale on
-      // target after a setval() that hasn't been touched by nextval()).
-      let srcMax = 0;
-      if (r.tablename && r.colname) {
-        try {
-          const mx = await src.query<{ m: string | null }>(
-            `SELECT COALESCE(max("${r.colname}"), 0)::text AS m FROM "public"."${r.tablename}"`,
-          );
-          srcMax = parseInt(mx.rows[0].m ?? "0", 10);
-        } catch {
-          /* fall through */
-        }
-      }
-      if (srcMax === 0) {
-        const ls = await src.query<{ lv: string }>(
-          `SELECT last_value::text AS lv FROM ${r.seq}`,
+    const sequenceErrors: string[] = [];
+    for (const relations of sequences.values()) {
+      const sequence = relations[0];
+      const displayName = `${sequence.sequence_schema}.${sequence.sequence_name}`;
+      try {
+        const increment = BigInt(sequence.increment_by);
+        const [sourceState, targetState, boundary] = await Promise.all([
+          readSequenceState(
+            src,
+            sequence.sequence_schema,
+            sequence.sequence_name,
+          ),
+          readSequenceState(
+            tgt,
+            sequence.sequence_schema,
+            sequence.sequence_name,
+          ),
+          readSequenceBoundary(src, relations, increment),
+        ]);
+        const required = requiredSequenceValue(
+          sourceState,
+          boundary.value,
+          increment,
         );
-        srcMax = parseInt(ls.rows[0].lv, 10);
-      }
-
-      const tlv = await tgt
-        .query<{ lv: string }>(`SELECT last_value::text AS lv FROM ${r.seq}`)
-        .catch(() => null);
-      if (!tlv) continue;
-      const tgtVal = parseInt(tlv.rows[0].lv, 10);
-
-      const driftBy = srcMax - tgtVal;
-      if (driftBy > 0) {
+        const requiredIsCalled = boundary.hasRows || sourceState.isCalled;
+        const targetBehind =
+          increment < BigInt(0)
+            ? targetState.lastValue > required
+            : targetState.lastValue < required;
+        const callStateWouldCollide =
+          targetState.lastValue === required &&
+          requiredIsCalled &&
+          !targetState.isCalled;
+        if (!targetBehind && !callStateWouldCollide) continue;
+        const relation = relations[0];
         drift.push({
-          sequence: r.seq,
-          table: r.tablename ? `public.${r.tablename}` : null,
-          column: r.colname,
-          sourceLastValue: srcMax,
-          targetLastValue: tgtVal,
-          driftBy,
-          recommendedTargetValue: srcMax + SAFETY,
+          sequence: displayName,
+          table: `${relation.table_schema}.${relation.table_name}`,
+          column: relation.column_name,
+          sourceLastValue: displaySequenceNumber(required),
+          targetLastValue: displaySequenceNumber(targetState.lastValue),
+          driftBy: displaySequenceNumber(
+            required - targetState.lastValue,
+          ),
+          recommendedTargetValue: displaySequenceNumber(required),
         });
+      } catch (error) {
+        sequenceErrors.push(
+          `${displayName}: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
 
     // Row counts per replicated table
-    const tables = perTable.rows.map((r) => r.table);
+    const tables = perTable.rows.map((table) => ({
+      ...table,
+      qualifiedName: `${table.schema}.${table.table}`,
+    }));
     const rowCounts: RowCountCheck[] = [];
-    for (const fqTable of tables) {
+    for (const table of tables) {
       try {
         const [srcRes, tgtRes] = await Promise.all([
-          src.query<{ n: string }>(`SELECT count(*)::text AS n FROM ${fqTable}`),
-          tgt.query<{ n: string }>(`SELECT count(*)::text AS n FROM ${fqTable}`),
+          src.query<{ n: string }>(
+            `SELECT count(*)::text AS n FROM ${qualifiedIdentifier(table.schema, table.table)}`,
+          ),
+          tgt.query<{ n: string }>(
+            `SELECT count(*)::text AS n FROM ${qualifiedIdentifier(table.schema, table.table)}`,
+          ),
         ]);
         const srcRows = parseInt(srcRes.rows[0].n, 10);
         const tgtRows = parseInt(tgtRes.rows[0].n, 10);
         rowCounts.push({
-          table: fqTable,
+          table: table.qualifiedName,
           sourceRows: srcRows,
           targetRows: tgtRows,
           delta: srcRows - tgtRows,
@@ -214,7 +498,7 @@ export async function preflight(
       blockers.push(
         `${notStreaming.length} table(s) not yet streaming: ${notStreaming
           .slice(0, 5)
-          .map((t) => t.table)
+          .map((table) => `${table.schema}.${table.table}`)
           .join(", ")}`,
       );
     }
@@ -225,6 +509,11 @@ export async function preflight(
     } else if (slotActive === false) {
       blockers.push(
         `Replication slot '${subName}' exists but is inactive (no walsender attached). New writes won't replicate — re-run setup or restart the subscription.`,
+      );
+    }
+    if (sequenceErrors.length > 0) {
+      blockers.push(
+        `Could not verify ${sequenceErrors.length} target sequence${sequenceErrors.length === 1 ? "" : "s"}: ${sequenceErrors.slice(0, 3).join("; ")}${sequenceErrors.length > 3 ? "; …" : ""}`,
       );
     }
     // Lag thresholds — these are intentionally conservative since any lag
@@ -262,7 +551,7 @@ export async function preflight(
           `Logical replication copies rows but does not copy sequence state, so target sequences are still near 1 while replicated rows already use IDs up through source max. ` +
           `If you cut over without fixing this, the very first INSERT from your app will call nextval(), get a low value like 2 or 3, and fail with "duplicate key value violates unique constraint" because that row already exists from replication. ` +
           `Symptoms in your app: 500 errors on every write, retried inserts looping forever, ORM transactions rolling back, queues backing up, audit/event tables silently dropping records. ` +
-          `Every write will fail until the sequence catches up past every replicated row's ID. The Execute Cutover step prevents all of this by running Neon's recommended DO block to set each target sequence to MAX(column) on target so the next nextval() returns a safe value. ` +
+          `Every write will fail until the sequence catches up past every replicated row's ID. Execute Cutover prevents this by discovering serial and identity dependencies from PostgreSQL catalogs and synchronizing each target sequence without moving it backward. ` +
           `Examples: ${examples}${drift.length > 3 ? ", ..." : ""}.`,
       );
     }
@@ -360,13 +649,9 @@ export async function execute(
     return { result: lag, detail: `final lag = ${lag} bytes` };
   });
 
-  // Reset sequences on target using Neon's recommended DO $$ block.
-  // This walks information_schema.columns for every column whose default
-  // calls nextval(...), looks up the owning sequence via
-  // pg_get_serial_sequence(), then sets it to max(column).
-  // More robust than our per-sequence loop because it covers all owned
-  // sequences uniformly, including ones we may have missed during drift
-  // detection (e.g. composite types, partitioned tables).
+  // Synchronize serial, identity, and explicit nextval() sequences associated
+  // with this subscription. Catalog dependencies preserve custom schemas and
+  // avoid information_schema.column_default, which is NULL for identities.
   const resetSeqs: SequenceDrift[] = [];
   await runStep("sequences", "Reset target sequences", async () => {
     if (opts.dryRun) {
@@ -374,67 +659,37 @@ export async function execute(
     }
     const tgt = new Client({ connectionString: unpool(targetConn) });
     await tgt.connect();
+    let replicatedTables: { schema: string; table: string }[];
     try {
-      // Neon's recommended DO block, with a NULL-guard.
-      // pg_get_serial_sequence() returns NULL when a column's nextval()
-      // default references a sequence that isn't formally owned by the
-      // column (no ALTER SEQUENCE ... OWNED BY). Our schema-copy creates
-      // sequences this way, so the unguarded version of this block fails
-      // with SQLSTATE 22004 (query string argument of EXECUTE is null)
-      // on the first sequence it can't resolve.
-      //
-      // The guard does two things:
-      //   1. If pg_get_serial_sequence() returns NULL, parse the actual
-      //      sequence name out of column_default ("nextval('foo_id_seq'::regclass)").
-      //   2. If we still can't resolve a sequence, skip the row instead
-      //      of passing NULL to quote_literal().
-      const NEON_SEQUENCE_RESET = `
-        DO $$
-            DECLARE
-                i RECORD;
-                resolved_seq text;
-            BEGIN
-                FOR i IN
-                    SELECT
-                        table_name,
-                        table_schema,
-                        column_name,
-                        column_default,
-                        pg_get_serial_sequence(
-                          quote_ident(table_schema) || '.' || quote_ident(table_name),
-                          column_name
-                        ) AS owned_seq
-                    FROM information_schema.columns
-                    WHERE column_default LIKE 'nextval%'
-                LOOP
-                    resolved_seq := i.owned_seq;
-                    IF resolved_seq IS NULL THEN
-                        -- Parse: nextval('public.foo_id_seq'::regclass) → public.foo_id_seq
-                        resolved_seq := substring(
-                          i.column_default
-                          FROM 'nextval\\(''([^'']+)'''
-                        );
-                    END IF;
-                    IF resolved_seq IS NULL THEN
-                        CONTINUE;
-                    END IF;
-                    EXECUTE format(
-                      'SELECT setval(%L, COALESCE((SELECT MAX(%I) FROM %I.%I), 1))',
-                      resolved_seq, i.column_name, i.table_schema, i.table_name
-                    );
-                END LOOP;
-            END
-        $$ LANGUAGE plpgsql;
-      `;
-      await tgt.query(NEON_SEQUENCE_RESET);
-      // Carry the preflight-detected drift into the result for reporting.
-      resetSeqs.push(...pre.sequenceDrift);
+      const result = await tgt.query<{
+        schema: string;
+        table: string;
+      }>(
+        `SELECT table_ns.nspname AS schema, table_class.relname AS table
+         FROM pg_subscription_rel relation
+         JOIN pg_subscription subscription
+           ON subscription.oid = relation.srsubid
+         JOIN pg_class table_class
+           ON table_class.oid = relation.srrelid
+         JOIN pg_namespace table_ns
+           ON table_ns.oid = table_class.relnamespace
+         WHERE subscription.subname = $1`,
+        [subName],
+      );
+      replicatedTables = result.rows;
     } finally {
       await tgt.end();
     }
+    resetSeqs.push(
+      ...(await synchronizeTargetSequences(
+        sourceConn,
+        targetConn,
+        replicatedTables,
+      )),
+    );
     return {
       result: resetSeqs.length,
-      detail: `${resetSeqs.length || "all"} owned sequence(s) reset to max(col) via Neon DO block`,
+      detail: `${resetSeqs.length} serial and identity sequence(s) synchronized`,
     };
   });
 

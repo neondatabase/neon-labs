@@ -78,6 +78,23 @@ type Phase =
   | "analyzing-target"
   | "tearing-down";
 
+const MIGRATION_STEPS = [
+  "Preflight",
+  "Enable logical replication",
+  "Provision replication",
+  "Live replication",
+  "Analyze target",
+  "Cutover",
+] as const;
+
+type MigrationStepState = "completed" | "current" | "blocked" | "upcoming";
+type MigrationQuietStatusState =
+  | "ready"
+  | "provisioning"
+  | "error"
+  | "stopped"
+  | "warning";
+
 export default function ReplicationPage() {
   const { assessment } = useAssessment();
   const [cfg, setCfg] = useState<NeonConfig | null>(null);
@@ -96,6 +113,7 @@ export default function ReplicationPage() {
     null,
   );
   const [confirmCutover, setConfirmCutover] = useState(false);
+  const [sourceWritesStopped, setSourceWritesStopped] = useState(false);
   const [copiedConn, setCopiedConn] = useState(false);
   const [monitor, setMonitor] = useState<ReplicationMonitor | null>(null);
   const [monitorLoading, setMonitorLoading] = useState(false);
@@ -114,6 +132,8 @@ export default function ReplicationPage() {
   const [teardownInspecting, setTeardownInspecting] = useState(false);
   const [teardownRecheckAttempts, setTeardownRecheckAttempts] = useState(0);
   const recoveryChecks = useRef(new Set<string>());
+  const statusPollAbort = useRef<AbortController | null>(null);
+  const statusPollRequest = useRef(0);
 
   useEffect(() => {
     // Hydrate tab-scoped project choices after the client mounts.
@@ -174,6 +194,17 @@ export default function ReplicationPage() {
     else setClassifiedError(null);
     return raw;
   }
+
+  useEffect(() => {
+    if (!classifiedError?.stage) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      const panel = document.getElementById("replication-setup-error");
+      panel?.focus({ preventScroll: true });
+      panel?.scrollIntoView({ behavior: "auto", block: "center" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [classifiedError]);
 
   const inspectTeardown = useCallback(async (): Promise<ReplicationResourceInspection | null> => {
     setTeardownInspecting(true);
@@ -369,30 +400,69 @@ export default function ReplicationPage() {
 
   // Auto-poll status during monitoring phase
   const pollStatus = useCallback(async () => {
+    if (statusPollAbort.current) return;
+    const controller = new AbortController();
+    const requestId = ++statusPollRequest.current;
+    statusPollAbort.current = controller;
     try {
       const res = await fetch("/api/neon/replication/status", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(targetBody()),
+        signal: controller.signal,
       });
       const body = await res.json();
-      if (res.ok) setStatus(body);
+      if (
+        res.ok &&
+        !controller.signal.aborted &&
+        requestId === statusPollRequest.current
+      ) {
+        setStatus(body);
+      }
     } catch {
       /* swallow polling errors */
+    } finally {
+      if (statusPollAbort.current === controller) {
+        statusPollAbort.current = null;
+      }
     }
   }, [targetBody]);
 
   useEffect(() => {
-    if (phase !== "monitoring") return;
-    const initial = window.setTimeout(() => void pollStatus(), 0);
-    const i = setInterval(pollStatus, 3000);
+    if (phase !== "monitoring") {
+      statusPollRequest.current += 1;
+      statusPollAbort.current?.abort();
+      statusPollAbort.current = null;
+      return;
+    }
+
+    let cancelled = false;
+    let timeout: number | null = null;
+    const pollAndSchedule = async () => {
+      await pollStatus();
+      if (!cancelled) {
+        timeout = window.setTimeout(() => void pollAndSchedule(), 3000);
+      }
+    };
+    const pollWhenVisible = () => {
+      if (document.visibilityState === "visible") void pollStatus();
+    };
+
+    void pollAndSchedule();
+    document.addEventListener("visibilitychange", pollWhenVisible);
     return () => {
-      window.clearTimeout(initial);
-      clearInterval(i);
+      cancelled = true;
+      if (timeout !== null) window.clearTimeout(timeout);
+      document.removeEventListener("visibilitychange", pollWhenVisible);
+      statusPollRequest.current += 1;
+      statusPollAbort.current?.abort();
+      statusPollAbort.current = null;
     };
   }, [phase, pollStatus]);
 
   async function runPreflight() {
+    setConfirmCutover(false);
+    setSourceWritesStopped(false);
     setPhase("preflighting");
     setError(null);
     try {
@@ -412,7 +482,10 @@ export default function ReplicationPage() {
         setConfirmTeardown(false);
       }
       if (!tableSelectionReady) {
-        setSelectedTables(result.source.tables);
+        const unlogged = new Set(result.source.unloggedTables ?? []);
+        setSelectedTables(
+          result.source.tables.filter((table) => !unlogged.has(table)),
+        );
         setTableSelectionReady(true);
       }
       if (result.resumeMonitoring) {
@@ -469,6 +542,8 @@ export default function ReplicationPage() {
   }
 
   async function runSetup() {
+    setConfirmCutover(false);
+    setSourceWritesStopped(false);
     setPhase("setting-up");
     setError(null);
     setResumedSession(false);
@@ -520,6 +595,8 @@ export default function ReplicationPage() {
   }
 
   async function runCutoverPreflight() {
+    setConfirmCutover(false);
+    setSourceWritesStopped(false);
     setPhase("cutover-preflight");
     setError(null);
     try {
@@ -540,6 +617,7 @@ export default function ReplicationPage() {
   }
 
   async function executeCutover() {
+    if (!sourceWritesStopped) return;
     if (!confirmCutover) {
       setConfirmCutover(true);
       return;
@@ -550,13 +628,17 @@ export default function ReplicationPage() {
       const res = await fetch("/api/neon/cutover/execute", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(targetBody()),
+        body: JSON.stringify({
+          ...targetBody(),
+          sourceWritesStopped,
+        }),
       });
       const body = await res.json();
       if (!res.ok) throw new Error(handleApiError(body, `Failed (${res.status})`));
       setClassifiedError(null);
       setCutoverResult(body);
       setConfirmCutover(false);
+      setSourceWritesStopped(false);
       setPhase("cutover-complete");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Cutover failed");
@@ -600,6 +682,8 @@ export default function ReplicationPage() {
       setClassifiedError(null);
       setCutoverResult(null);
       setCutoverPre(null);
+      setConfirmCutover(false);
+      setSourceWritesStopped(false);
       setPhase("monitoring");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Rollback failed");
@@ -718,8 +802,9 @@ export default function ReplicationPage() {
 
   const pickerRow = (
     <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-[4px] border border-[#262727] bg-[#131414] px-4 py-3">
-      <div className="flex flex-wrap items-center gap-3 text-caption">
+      <div className="flex w-full flex-col items-stretch gap-3 text-caption sm:flex-row sm:flex-wrap sm:items-center">
         <TargetProjectPicker
+          className="min-w-0 flex-wrap sm:w-auto sm:flex-nowrap"
           role="source"
           targetPgVersion={assessment?.sourceVersion ?? 14}
           onChange={(t) => {
@@ -731,6 +816,8 @@ export default function ReplicationPage() {
             setMonitor(null);
             setCutoverPre(null);
             setCutoverResult(null);
+            setConfirmCutover(false);
+            setSourceWritesStopped(false);
             setSelectedTables([]);
             setTableSelectionReady(false);
             setResumedSession(false);
@@ -740,8 +827,14 @@ export default function ReplicationPage() {
             setPhase("idle");
           }}
         />
-        <span className="text-[#00e599]">→</span>
+        <span
+          aria-hidden
+          className="self-center text-[#00e599] max-sm:rotate-90"
+        >
+          →
+        </span>
         <TargetProjectPicker
+          className="min-w-0 flex-wrap sm:w-auto sm:flex-nowrap"
           role="target"
           targetPgVersion={assessment?.targetVersion ?? 17}
           onChange={(t) => {
@@ -752,6 +845,8 @@ export default function ReplicationPage() {
             setMonitor(null);
             setCutoverPre(null);
             setCutoverResult(null);
+            setConfirmCutover(false);
+            setSourceWritesStopped(false);
             setResumedSession(false);
             setTeardownInspection(null);
             setTeardownResult(null);
@@ -760,7 +855,6 @@ export default function ReplicationPage() {
           }}
         />
       </div>
-      <span className="text-label text-[#9ca3af]">Phase: {phase}</span>
     </div>
   );
 
@@ -778,6 +872,105 @@ export default function ReplicationPage() {
     </Notice>
   );
 
+  const setupRecoveryComplete = Boolean(
+    !setup &&
+      !cutoverResult &&
+      teardownResult?.cleanupComplete &&
+      teardownResult.before.anyResourceExists &&
+      teardownResult.before.subscription.state === "absent",
+  );
+  const setupRecoveryActive = Boolean(
+    !setup &&
+      !cutoverResult &&
+      !setupRecoveryComplete &&
+      teardownInspection?.anyResourceExists &&
+      teardownInspection.subscription.state === "absent",
+  );
+  const setupRequirementsRemaining =
+    Number(Boolean(preflight && !preflight.ok)) +
+    Number(setupRecoveryActive);
+  const setupClassifiedError = classifiedError?.stage
+    ? classifiedError
+    : null;
+  const setupErrorShownInProvisioning = Boolean(
+    setupClassifiedError &&
+      preflight?.source.logicalReplicationEnabled &&
+      !setup,
+  );
+  const setupNeedsAttention =
+    setupRequirementsRemaining > 0 || setupErrorShownInProvisioning;
+  const teardownSection =
+    teardownInspection?.anyResourceExists || teardownResult ? (
+      <div id="replication-teardown">
+        <Section
+          eyebrow={
+            setupRecoveryActive || setupRecoveryComplete
+              ? "Recovery"
+              : "Cleanup"
+          }
+          title={
+            setupRecoveryActive || setupRecoveryComplete
+              ? "Setup recovery"
+              : "Replication teardown"
+          }
+          subtitle={
+            setupRecoveryActive
+              ? "Remove partial resources from an earlier setup attempt before retrying"
+              : setupRecoveryComplete
+                ? "Recovery complete. Replication setup is ready to retry"
+                : "Inspect and remove only the replication resources created by this application"
+          }
+          danger
+          action={
+            <Button
+              disabled={teardownInspecting}
+              size="lg"
+              variant="ghost"
+              onClick={() => void inspectTeardown()}
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Refresh resources
+            </Button>
+          }
+        >
+          {teardownInspection ? (
+            <TeardownPanel
+              inspection={teardownInspection}
+              result={teardownResult}
+              confirmed={confirmTeardown}
+              busy={phase === "tearing-down"}
+              checking={teardownInspecting}
+              recheckAttempts={teardownRecheckAttempts}
+              setupRecovery={setupRecoveryActive || setupRecoveryComplete}
+              sourceProjectId={sourceProjectId}
+              inspectionSqlCopied={copiedSql === "active-slot-inspection"}
+              onCopyInspectionSql={(sql) =>
+                void copySql("active-slot-inspection", sql)
+              }
+              onConfirmedChange={setConfirmTeardown}
+              onReleaseActiveSlot={releaseActiveSlotAndTeardown}
+              onTeardown={runTeardown}
+            />
+          ) : null}
+        </Section>
+      </div>
+    ) : null;
+  const progressTracker = (
+    <MigrationProgress
+      phase={phase}
+      preflight={preflight}
+      setup={setup}
+      status={status}
+      analyzeResult={analyzeResult}
+      cutoverPre={cutoverPre}
+      cutoverResult={cutoverResult}
+      teardownInspection={teardownInspection}
+      teardownResult={teardownResult}
+      setupRecoveryActive={setupRecoveryActive}
+      setupRecoveryComplete={setupRecoveryComplete}
+    />
+  );
+
   if (!sourceReady || !targetReady) {
     return (
       <div className={neon.page}>
@@ -787,8 +980,9 @@ export default function ReplicationPage() {
             subtitle="One-click logical replication setup between your source and target Neon projects"
             actions={authAction}
           />
-          {pickerRow}
           {workloadNotice}
+          {pickerRow}
+          {progressTracker}
           <Notice tone="warning">
             <NoticeIcon>
               <AlertTriangle />
@@ -818,12 +1012,12 @@ export default function ReplicationPage() {
       <div className={neon.pageContent}>
         <PageHeader
           title="Logical replication"
-          subtitle="Source → target setup, automated. Schema copy · publication · subscription · live lag monitoring."
           actions={authAction}
         />
 
-        {pickerRow}
         {workloadNotice}
+        {pickerRow}
+        {progressTracker}
 
         {/* Brief overview, collapsible. Lands users oriented without
             forcing them to read a wall of text before they can act. */}
@@ -919,6 +1113,7 @@ export default function ReplicationPage() {
 
         {/* Step 1: Preflight */}
         <Section
+          id="replication-preflight"
           step="01"
           title="Preflight"
           subtitle="Verify source wal_level, replication role, table primary keys, target schema readiness"
@@ -971,7 +1166,13 @@ export default function ReplicationPage() {
             danger
             action={
               <div className="flex flex-col items-end gap-2">
-                <Button size="lg"
+                <Button
+                  className={
+                    confirmEnable
+                      ? "bg-[#ef4444] text-white opacity-100 hover:bg-[#dc2626] dark:bg-[#ef4444] dark:hover:bg-[#dc2626]"
+                      : undefined
+                  }
+                  size="lg"
                   onClick={enableSourceLogicalReplication}
                   disabled={!authenticated || phase === "enabling"}
                   variant={confirmEnable ? "destructive" : "white"}
@@ -984,7 +1185,7 @@ export default function ReplicationPage() {
                   ) : confirmEnable ? (
                     <>
                       <AlertOctagon className="h-3.5 w-3.5" />
-                      Confirm — this is irreversible
+                      Yes, enable logical replication
                     </>
                   ) : (
                     <>
@@ -1013,7 +1214,26 @@ export default function ReplicationPage() {
         {/* Step 3: Setup */}
         {preflight && preflight.source.logicalReplicationEnabled && !setup && (
           <Section
+            current
+            danger={setupNeedsAttention}
+            id="replication-provisioning"
             step="03"
+            status={{
+              state:
+                phase === "setting-up"
+                  ? "provisioning"
+                  : setupNeedsAttention
+                    ? "warning"
+                    : "ready",
+              label:
+                phase === "setting-up"
+                  ? "In progress"
+                  : setupNeedsAttention
+                    ? "Needs attention"
+                    : setupRecoveryComplete
+                      ? "Ready to retry"
+                      : "Current",
+            }}
             title="Provision publication + subscription"
             subtitle="Copies schema, creates publication on source, creates subscription on target"
             action={
@@ -1028,8 +1248,8 @@ export default function ReplicationPage() {
                     phase === "setting-up"
                   }
                   title={
-                    !preflight.ok
-                      ? "Resolve the preflight blockers before starting replication."
+                    setupRequirementsRemaining > 0
+                      ? "Complete the requirements shown below before starting replication."
                       : selectedTables.length === 0
                         ? "Select at least one table to replicate."
                       : undefined
@@ -1047,9 +1267,11 @@ export default function ReplicationPage() {
                     </>
                   )}
                 </Button>
-                {!preflight.ok ? (
+                {setupRequirementsRemaining > 0 ? (
                   <p className="text-label text-[#f59e0b]">
-                    Resolve the preflight blockers above to continue.
+                    Complete the {setupRequirementsRemaining} requirement
+                    {setupRequirementsRemaining === 1 ? "" : "s"} below to
+                    continue.
                   </p>
                 ) : selectedTables.length === 0 ? (
                   <p className="text-label text-[#f59e0b]">
@@ -1059,7 +1281,35 @@ export default function ReplicationPage() {
               </div>
             }
           >
+            <SetupRequirements
+              preflight={preflight}
+              recoveryActive={setupRecoveryActive}
+              recoveryComplete={setupRecoveryComplete}
+              onReviewPreflight={() =>
+                document
+                  .getElementById("replication-preflight")
+                  ?.scrollIntoView({ behavior: "auto", block: "start" })
+              }
+              onReviewRecovery={() =>
+                document
+                  .getElementById("replication-teardown")
+                  ?.scrollIntoView({ behavior: "auto", block: "start" })
+              }
+            />
+            {setupClassifiedError ? (
+              <div
+                id="replication-setup-error"
+                role="alert"
+                tabIndex={-1}
+              >
+                <ClassifiedErrorBanner
+                  classified={setupClassifiedError}
+                  onAction={handleRecoveryAction}
+                />
+              </div>
+            ) : null}
             <TableSelection
+              ineligibleTables={preflight.source.unloggedTables ?? []}
               tables={preflight.source.tables}
               selectedTables={selectedTables}
               onChange={setSelectedTables}
@@ -1082,6 +1332,9 @@ export default function ReplicationPage() {
             </ol>
           </Section>
         )}
+        {setupRecoveryActive || setupRecoveryComplete
+          ? teardownSection
+          : null}
 
         {/* Step 4: Monitor */}
         {setup && (
@@ -1270,56 +1523,106 @@ export default function ReplicationPage() {
             subtitle="Drain lag, reset sequences, disable subscription, swap connection strings"
             danger
             action={
-              !cutoverPre ? (
-                <Button size="lg" variant="white"
-                  onClick={runCutoverPreflight}
-                  disabled={phase === "cutover-preflight"}
-                >
-                  {phase === "cutover-preflight" ? (
-                    <>
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      Checking…
-                    </>
-                  ) : (
-                    <>
-                      <RefreshCw className="h-3.5 w-3.5" />
-                      Cutover preflight
-                    </>
-                  )}
-                </Button>
-              ) : (
-                <div className="flex gap-2">
-                  <Button size="lg" variant="ghost" onClick={runCutoverPreflight}>
-                    <RefreshCw className="h-3.5 w-3.5" />
-                    Re-check
-                  </Button>
-                  <Button size="lg"
-                    onClick={executeCutover}
-                    disabled={!cutoverPre.ok || phase === "cutting-over"}
-                    variant={confirmCutover ? "destructive" : "white"}
+              <div className="flex max-w-[480px] flex-col items-end gap-2">
+                {cutoverPre ? (
+                  <label className="flex cursor-pointer items-start gap-2 text-left text-label leading-[1.5] text-foreground">
+                    <input
+                      aria-describedby="cutover-source-impact"
+                      checked={sourceWritesStopped}
+                      className="mt-0.5 size-3.5 shrink-0 accent-[#f59e0b]"
+                      disabled={phase === "cutting-over"}
+                      onChange={(event) => {
+                        setSourceWritesStopped(event.target.checked);
+                        if (!event.target.checked) setConfirmCutover(false);
+                      }}
+                      type="checkbox"
+                    />
+                    <span>
+                      I confirm that all application writes to the source
+                      database are stopped.
+                    </span>
+                  </label>
+                ) : null}
+                {!cutoverPre ? (
+                  <Button
+                    disabled={phase === "cutover-preflight"}
+                    onClick={runCutoverPreflight}
+                    size="lg"
+                    variant="white"
                   >
-                    {phase === "cutting-over" ? (
+                    {phase === "cutover-preflight" ? (
                       <>
                         <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        Cutting over…
-                      </>
-                    ) : confirmCutover ? (
-                      <>
-                        <AlertOctagon className="h-3.5 w-3.5" />
-                        Confirm cutover
+                        Checking…
                       </>
                     ) : (
                       <>
-                        <Repeat className="h-3.5 w-3.5" />
-                        Execute cutover
+                        <RefreshCw className="h-3.5 w-3.5" />
+                        Cutover preflight
                       </>
                     )}
                   </Button>
-                </div>
-              )
+                ) : (
+                  <div className="flex gap-2">
+                    <Button
+                      onClick={runCutoverPreflight}
+                      size="lg"
+                      variant="ghost"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      Re-check
+                    </Button>
+                    <Button
+                      aria-describedby="cutover-source-impact"
+                      className={
+                        confirmCutover
+                          ? "border-[#f59e0b] bg-[#f59e0b] text-black opacity-100 hover:bg-[#fbbf24] dark:bg-[#f59e0b] dark:hover:bg-[#fbbf24]"
+                          : undefined
+                      }
+                      disabled={
+                        !cutoverPre.ok ||
+                        !sourceWritesStopped ||
+                        phase === "cutting-over"
+                      }
+                      onClick={executeCutover}
+                      size="lg"
+                      variant={confirmCutover ? "outline" : "white"}
+                    >
+                      {phase === "cutting-over" ? (
+                        <>
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          Cutting over…
+                        </>
+                      ) : confirmCutover ? (
+                        <>
+                          <AlertOctagon className="h-3.5 w-3.5" />
+                          Confirm switch to target
+                        </>
+                      ) : (
+                        <>
+                          <Repeat className="h-3.5 w-3.5" />
+                          Execute cutover
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                )}
+              </div>
             }
           >
-            {cutoverPre && <CutoverPreflightDetails p={cutoverPre} />}
+            <p
+              className={`text-caption leading-[1.5] ${neon.muted}`}
+              id="cutover-source-impact"
+            >
+              Your source database stays running and unchanged. Cutover
+              synchronizes target sequences, disables the target subscription,
+              and returns the target connection string.
+            </p>
+            {cutoverPre && (
+              <div className="mt-4">
+                <CutoverPreflightDetails p={cutoverPre} />
+              </div>
+            )}
           </Section>
         )}
 
@@ -1354,78 +1657,17 @@ export default function ReplicationPage() {
           </Section>
         )}
 
-        {(teardownInspection?.anyResourceExists || teardownResult) && (
-          <div id="replication-teardown">
-            <Section
-              eyebrow={
-                !setup &&
-                !cutoverResult &&
-                teardownInspection?.subscription.state === "absent"
-                  ? "Recovery"
-                  : "Cleanup"
-              }
-              title={
-                !setup &&
-                !cutoverResult &&
-                teardownInspection?.subscription.state === "absent"
-                  ? "Setup recovery"
-                  : "Replication teardown"
-              }
-              subtitle={
-                !setup &&
-                !cutoverResult &&
-                teardownInspection?.subscription.state === "absent"
-                  ? "Remove partial resources from an earlier setup attempt before retrying"
-                  : "Inspect and remove only the replication resources created by this application"
-              }
-              danger
-              action={
-                <Button
-                  disabled={teardownInspecting}
-                  size="lg"
-                  variant="ghost"
-                  onClick={() => void inspectTeardown()}
-                >
-                  <RefreshCw className="h-3.5 w-3.5" />
-                  Refresh resources
-                </Button>
-              }
-            >
-              {teardownInspection ? (
-                <TeardownPanel
-                  inspection={teardownInspection}
-                  result={teardownResult}
-                  confirmed={confirmTeardown}
-                  busy={phase === "tearing-down"}
-                  checking={teardownInspecting}
-                  recheckAttempts={teardownRecheckAttempts}
-                  setupRecovery={
-                    !setup &&
-                    !cutoverResult &&
-                    teardownInspection.subscription.state === "absent"
-                  }
-                  sourceProjectId={sourceProjectId}
-                  inspectionSqlCopied={
-                    copiedSql === "active-slot-inspection"
-                  }
-                  onCopyInspectionSql={(sql) =>
-                    void copySql("active-slot-inspection", sql)
-                  }
-                  onConfirmedChange={setConfirmTeardown}
-                  onReleaseActiveSlot={releaseActiveSlotAndTeardown}
-                  onTeardown={runTeardown}
-                />
-              ) : null}
-            </Section>
-          </div>
-        )}
+        {!setupRecoveryActive && !setupRecoveryComplete
+          ? teardownSection
+          : null}
 
-        {classifiedError ? (
+        {classifiedError && !setupErrorShownInProvisioning ? (
           <ClassifiedErrorBanner
             classified={classifiedError}
             onAction={handleRecoveryAction}
           />
         ) : (
+          !classifiedError &&
           error && (
             <div className="mt-4 rounded-[4px] border border-[#ef4444]/40 bg-[#ef4444]/10 px-3 py-2 text-caption text-[#ef4444]">
               <span className="font-mono">error:</span> {error}
@@ -1438,37 +1680,469 @@ export default function ReplicationPage() {
   );
 }
 
+function MigrationQuietStatus({
+  state,
+  label,
+}: {
+  state: MigrationQuietStatusState;
+  label: string;
+}) {
+  const dotColor = {
+    ready: "bg-[#00e599]",
+    provisioning: "bg-[#00e599]",
+    error: "bg-[#ef4444]",
+    stopped: "bg-[#6b7280]",
+    warning: "bg-[#f59e0b]",
+  }[state];
+
+  return (
+    <span className="inline-flex items-center gap-1.5 font-mono text-label text-[#9ca3af]">
+      <span
+        aria-hidden
+        className={`size-1.5 shrink-0 rounded-[1px] ${dotColor} ${
+          state === "provisioning" ? "migration-status-breathe" : ""
+        }`}
+      />
+      {label}
+    </span>
+  );
+}
+
+function MigrationProgress({
+  phase,
+  preflight,
+  setup,
+  status,
+  analyzeResult,
+  cutoverPre,
+  cutoverResult,
+  teardownInspection,
+  teardownResult,
+  setupRecoveryActive,
+  setupRecoveryComplete,
+}: {
+  phase: Phase;
+  preflight: ReplicationPreflight | null;
+  setup: ReplicationSetupResult | null;
+  status: ReplicationStatus | null;
+  analyzeResult: AnalyzeTargetResult | null;
+  cutoverPre: CutoverPreflight | null;
+  cutoverResult: CutoverResult | null;
+  teardownInspection: ReplicationResourceInspection | null;
+  teardownResult: ReplicationTeardownResult | null;
+  setupRecoveryActive: boolean;
+  setupRecoveryComplete: boolean;
+}) {
+  const analyzeSucceeded = analyzeResult?.missingStatsAfter === 0;
+  const cutoverStarted =
+    phase === "cutover-preflight" ||
+    phase === "cutover-ready" ||
+    phase === "cutting-over" ||
+    cutoverPre !== null ||
+    cutoverResult !== null;
+  const preflightHasNonEnablementBlocker = Boolean(
+    preflight &&
+      (!preflight.source.roleHasReplication ||
+        preflight.source.tableCount === 0),
+  );
+
+  let currentStep = 1;
+  let blocked = false;
+  let summary = "Ready to run preflight";
+  let detail: string | null = null;
+  let summaryStatus: MigrationQuietStatusState = "ready";
+  let summaryStatusLabel = "Current";
+
+  if (cutoverResult) {
+    currentStep = 6;
+    summary = "Cutover complete";
+    detail = "Traffic can move to the target";
+    summaryStatusLabel = "Complete";
+  } else if (setupRecoveryActive || setupRecoveryComplete) {
+    currentStep = 3;
+    const remainingRequirements = [
+      ...(preflight && !preflight.ok ? ["preflight"] : []),
+      ...(setupRecoveryActive ? ["setup recovery"] : []),
+    ];
+    blocked = remainingRequirements.length > 0;
+    summary = "Provision replication";
+    detail =
+      setupRecoveryActive && phase === "tearing-down"
+        ? "Removing partial resources before provisioning"
+        : remainingRequirements.length > 0
+          ? `${remainingRequirements.length} requirement${remainingRequirements.length === 1 ? "" : "s"} remaining · ${remainingRequirements.join(" + ")}`
+          : "Recovery complete · Provisioning can be started again";
+    summaryStatus =
+      setupRecoveryActive && phase === "tearing-down"
+        ? "provisioning"
+        : blocked
+          ? "warning"
+          : "ready";
+    summaryStatusLabel =
+      setupRecoveryActive && phase === "tearing-down"
+        ? "In progress"
+        : blocked
+          ? "Needs attention"
+          : "Current";
+  } else if (!preflight || phase === "preflighting") {
+    currentStep = 1;
+    if (phase === "preflighting") {
+      summary = "Checking source and target";
+      summaryStatus = "provisioning";
+      summaryStatusLabel = "In progress";
+    }
+  } else if (!preflight.source.logicalReplicationEnabled) {
+    currentStep = 2;
+    blocked = preflightHasNonEnablementBlocker;
+    summary =
+      phase === "enabling"
+        ? "Enabling logical replication"
+        : blocked
+          ? "Preflight needs attention"
+          : "Logical replication is disabled";
+    detail = blocked
+      ? "Resolve the remaining preflight blockers before provisioning"
+      : "Enable it on the source to continue";
+    summaryStatus =
+      phase === "enabling" ? "provisioning" : blocked ? "error" : "warning";
+    summaryStatusLabel =
+      phase === "enabling"
+        ? "In progress"
+        : blocked
+          ? "Needs attention"
+          : "Action required";
+  } else if (!setup || phase === "setting-up") {
+    currentStep = 3;
+    blocked = !preflight.ok;
+    summary =
+      phase === "setting-up"
+        ? "Provisioning replication"
+        : blocked
+          ? "Preflight needs attention"
+          : "Ready to provision replication";
+    detail = blocked
+      ? "Resolve the preflight blockers before starting setup"
+      : "Publication and subscription are next";
+    summaryStatus =
+      phase === "setting-up" ? "provisioning" : blocked ? "error" : "ready";
+    summaryStatusLabel =
+      phase === "setting-up"
+        ? "In progress"
+        : blocked
+          ? "Needs attention"
+          : "Current";
+  } else if (status?.state !== "streaming" && !cutoverStarted) {
+    currentStep = 4;
+    blocked = status?.state === "stopped" || status?.state === "unknown";
+    if (status?.state === "copying") {
+      summary = "Initial copy in progress";
+      detail = `${status.readyTables} of ${status.totalTables} tables ready · ${
+        status.lagBytes === null ? "Lag unavailable" : `${formatBytes(status.lagBytes)} lag`
+      }`;
+      summaryStatus = "provisioning";
+      summaryStatusLabel = "In progress";
+    } else if (blocked) {
+      summary = "Replication needs attention";
+      detail = `Subscription state: ${status?.state ?? "unknown"}`;
+      summaryStatus = status?.state === "stopped" ? "stopped" : "error";
+      summaryStatusLabel = "Needs attention";
+    } else {
+      summary = "Waiting for replication status";
+      detail = "The first status poll will report copy progress";
+      summaryStatus = "stopped";
+      summaryStatusLabel = "Waiting";
+    }
+  } else if (!analyzeSucceeded && !cutoverStarted) {
+    currentStep = 5;
+    blocked = Boolean(analyzeResult && !analyzeSucceeded);
+    summary =
+      phase === "analyzing-target"
+        ? "Analyzing target"
+        : blocked
+          ? "Target analysis needs attention"
+          : "Ready to analyze target";
+    detail = blocked
+      ? `${analyzeResult?.missingStatsAfter ?? 0} relation(s) still need statistics`
+      : "Rebuild optimizer statistics before cutover";
+    summaryStatus =
+      phase === "analyzing-target" ? "provisioning" : blocked ? "warning" : "ready";
+    summaryStatusLabel =
+      phase === "analyzing-target"
+        ? "In progress"
+        : blocked
+          ? "Needs attention"
+          : "Current";
+  } else {
+    currentStep = 6;
+    blocked = Boolean(cutoverPre && !cutoverPre.ok);
+    if (phase === "cutover-preflight") {
+      summary = "Checking cutover readiness";
+      summaryStatus = "provisioning";
+      summaryStatusLabel = "In progress";
+    } else if (phase === "cutting-over") {
+      summary = "Cutover in progress";
+      summaryStatus = "provisioning";
+      summaryStatusLabel = "In progress";
+    } else if (blocked) {
+      summary = "Cutover needs attention";
+      detail = `${cutoverPre?.blockers.length ?? 0} blocker(s) must be resolved`;
+      summaryStatus = "error";
+      summaryStatusLabel = "Needs attention";
+    } else if (cutoverPre?.ok) {
+      summary = "Ready to cut over";
+      detail = "Preflight checks passed";
+    } else {
+      summary = "Ready for cutover preflight";
+      detail = "Check lag, row counts, sequences, and slot activity";
+    }
+  }
+
+  const allCompleted = Boolean(cutoverResult);
+  const stepStates = MIGRATION_STEPS.map<MigrationStepState>((_, index) => {
+    const step = index + 1;
+    if (allCompleted || step < currentStep) return "completed";
+    if (step === currentStep) return blocked ? "blocked" : "current";
+    return "upcoming";
+  });
+
+  const cleanupState = (() => {
+    if (setupRecoveryActive || setupRecoveryComplete) return null;
+    if (phase === "tearing-down") {
+      return {
+        state: "provisioning" as const,
+        label: "Tearing down",
+        detail: "Removing application-owned replication resources",
+      };
+    }
+    if (teardownResult && !teardownResult.cleanupComplete) {
+      return {
+        state: "error" as const,
+        label: "Needs attention",
+        detail: "Cleanup is incomplete. Review the remaining resources below",
+      };
+    }
+    if (teardownResult?.cleanupComplete) {
+      return {
+        state: "ready" as const,
+        label: "Cleanup complete",
+        detail: "No application-owned replication resources remain",
+      };
+    }
+    if (cutoverResult) {
+      return {
+        state: "warning" as const,
+        label: "Rollback window",
+        detail:
+          "Keep the source and replication resources available for 24–48 hours before teardown",
+      };
+    }
+    if (setup || teardownInspection?.anyResourceExists) {
+      return {
+        state: "stopped" as const,
+        label: "Cleanup available",
+        detail: "Teardown remains separate from the six migration steps",
+      };
+    }
+    return null;
+  })();
+
+  return (
+    <nav
+      aria-label="Migration progress"
+      className="mb-5 rounded-[4px] border border-[#262727] bg-[#131414] px-4 py-4 sm:px-5"
+    >
+      <div
+        aria-live="polite"
+        className="flex flex-wrap items-start justify-between gap-2"
+      >
+        <div>
+          <p className="font-mono text-caption text-foreground">
+            Step {currentStep} of {MIGRATION_STEPS.length}
+            <span className="text-[#6b7280]"> · </span>
+            {summary}
+          </p>
+          {detail ? (
+            <p className="mt-1 font-mono text-label tabular-nums text-[#9ca3af]">
+              {detail}
+            </p>
+          ) : null}
+        </div>
+        <MigrationQuietStatus
+          label={summaryStatusLabel}
+          state={summaryStatus}
+        />
+      </div>
+
+      <div className="relative mt-5">
+        <span
+          aria-hidden
+          className="absolute left-[8.333%] right-[8.333%] top-[5px] h-px bg-[#262727]"
+        />
+        <ol className="relative grid grid-cols-6">
+          {MIGRATION_STEPS.map((label, index) => {
+            const state = stepStates[index];
+            const isCurrent = index + 1 === currentStep;
+            const markerClass = {
+              completed: "border-[#00e599] bg-[#00e599]",
+              current: "border-[#00e599] bg-[#131414]",
+              blocked: "border-[#f59e0b] bg-[#f59e0b]",
+              upcoming: "border-[#4b4d4d] bg-[#131414]",
+            }[state];
+            const labelClass = {
+              completed: "text-[#9ca3af]",
+              current: "font-medium text-foreground",
+              blocked: "font-medium text-foreground",
+              upcoming: "text-[#6b7280]",
+            }[state];
+
+            return (
+              <li
+                aria-current={isCurrent ? "step" : undefined}
+                className="relative flex min-w-0 flex-col items-center px-0.5 text-center"
+                key={label}
+              >
+                <span
+                  aria-hidden
+                  className={`relative size-[11px] rounded-[1px] border transition-[transform,opacity,border-color,background-color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${markerClass} ${
+                    isCurrent ? "scale-110" : "scale-100"
+                  }`}
+                />
+                <span
+                  className={`mt-2 text-label leading-[1.35] transition-[color,opacity] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                    isCurrent ? "block" : "hidden sm:block"
+                  } ${labelClass}`}
+                >
+                  {label}
+                </span>
+                <span className="sr-only sm:not-sr-only sm:mt-1">
+                  <MigrationQuietStatus
+                    label={
+                      state === "completed"
+                        ? "Complete"
+                        : state === "blocked"
+                          ? "Needs attention"
+                          : state === "current"
+                            ? "Current"
+                            : "Upcoming"
+                    }
+                    state={
+                      state === "completed" || state === "current"
+                        ? "ready"
+                        : state === "blocked"
+                          ? "warning"
+                          : "stopped"
+                    }
+                  />
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+      </div>
+
+      {setupRecoveryActive || setupRecoveryComplete ? (
+        <div className="mt-4 flex items-start justify-between gap-3 border-t border-[#262727] pt-3">
+          <div>
+            <p className="text-caption font-medium text-foreground">
+              Setup recovery
+            </p>
+            <p className="mt-0.5 text-label text-[#9ca3af]">
+              {setupRecoveryComplete
+                ? "Complete · Step 3 is ready to retry"
+                : "Required · Complete the cleanup steps below before retrying"}
+            </p>
+          </div>
+          <MigrationQuietStatus
+            label={
+              setupRecoveryComplete
+                ? "Complete"
+                : phase === "tearing-down"
+                  ? "Cleaning up"
+                  : "Needs attention"
+            }
+            state={
+              setupRecoveryComplete
+                ? "ready"
+                : phase === "tearing-down"
+                  ? "provisioning"
+                  : "warning"
+            }
+          />
+        </div>
+      ) : null}
+
+      {cleanupState ? (
+        <div className="mt-4 flex flex-wrap items-start justify-between gap-3 border-t border-[#262727] pt-3">
+          <div>
+            <p className="text-caption font-medium text-foreground">
+              Replication cleanup
+            </p>
+            <p className="mt-0.5 max-w-2xl text-label leading-[1.5] text-[#9ca3af]">
+              {cleanupState.detail}
+            </p>
+          </div>
+          <MigrationQuietStatus
+            label={cleanupState.label}
+            state={cleanupState.state}
+          />
+        </div>
+      ) : null}
+    </nav>
+  );
+}
+
 function Section({
+  id,
   step,
   eyebrow,
   title,
   subtitle,
   action,
   children,
+  current,
+  status,
   danger,
 }: {
+  id?: string;
   step?: string;
   eyebrow?: string;
   title: string;
   subtitle?: string;
   action?: React.ReactNode;
   children?: React.ReactNode;
+  current?: boolean;
+  status?: {
+    state: MigrationQuietStatusState;
+    label: string;
+  };
   danger?: boolean;
 }) {
   return (
     <section
+      aria-current={current ? "step" : undefined}
+      id={id}
       className={`mb-5 rounded-[4px] border p-5 ${
         danger
           ? "border-[#f59e0b]/40 bg-[#f59e0b]/[0.04]"
+          : current
+            ? "border-[#00e599]/35 bg-[#00e599]/[0.025]"
           : "border-[#262727] bg-[#131414]"
       }`}
     >
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
           {(step || eyebrow) && (
-            <span className="text-micro uppercase tracking-[0.08em] text-[#00e599]">
-              {step ? `Step ${step}` : eyebrow}
-            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-micro uppercase tracking-[0.08em] text-[#00e599]">
+                {step ? `Step ${step}` : eyebrow}
+              </span>
+              {status ? (
+                <MigrationQuietStatus
+                  label={status.label}
+                  state={status.state}
+                />
+              ) : null}
+            </div>
           )}
           <h2 className={`${neon.h2} mt-1`}>{title}</h2>
           {subtitle && (
@@ -1484,16 +2158,137 @@ function Section({
   );
 }
 
+function SetupRequirements({
+  preflight,
+  recoveryActive,
+  recoveryComplete,
+  onReviewPreflight,
+  onReviewRecovery,
+}: {
+  preflight: ReplicationPreflight;
+  recoveryActive: boolean;
+  recoveryComplete: boolean;
+  onReviewPreflight: () => void;
+  onReviewRecovery: () => void;
+}) {
+  const requirements = [
+    ...(!preflight.ok
+      ? [
+          {
+            id: "preflight",
+            complete: false,
+            title: "Resolve preflight blockers",
+            detail:
+              preflight.blockers.length > 0
+                ? `${preflight.blockers.length} blocker${preflight.blockers.length === 1 ? "" : "s"} reported in Step 1`
+                : "Step 1 must pass before provisioning",
+            action: "Review preflight",
+            onAction: onReviewPreflight,
+          },
+        ]
+      : []),
+    ...(recoveryActive || recoveryComplete
+      ? [
+          {
+            id: "recovery",
+            complete: recoveryComplete,
+            title: "Clean up partial setup resources",
+            detail: recoveryComplete
+              ? "Cleanup complete. Step 3 is ready to retry"
+              : "Resources from an earlier attempt must be removed",
+            action: recoveryComplete ? null : "Review cleanup",
+            onAction: onReviewRecovery,
+          },
+        ]
+      : []),
+  ];
+
+  if (requirements.length === 0) return null;
+
+  const remaining = requirements.filter(
+    (requirement) => !requirement.complete,
+  ).length;
+
+  return (
+    <div
+      className={`mb-4 rounded-[4px] border p-3 ${
+        remaining > 0
+          ? "border-[#f59e0b]/35 bg-[#f59e0b]/[0.06]"
+          : "border-[#00e599]/35 bg-[#00e599]/[0.06]"
+      }`}
+    >
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <p className="text-caption font-medium text-foreground">
+            {remaining > 0
+              ? "Before Step 3 can continue"
+              : "Step 3 requirements complete"}
+          </p>
+          <p className="mt-0.5 text-label text-[#9ca3af]">
+            {remaining > 0
+              ? `${remaining} requirement${remaining === 1 ? "" : "s"} remaining`
+              : "Provisioning can be started again"}
+          </p>
+        </div>
+        <MigrationQuietStatus
+          label={remaining > 0 ? "Needs attention" : "Ready"}
+          state={remaining > 0 ? "warning" : "ready"}
+        />
+      </div>
+
+      <ul className="mt-3 divide-y divide-[#262727] border-t border-[#262727]">
+        {requirements.map((requirement) => (
+          <li
+            className="flex flex-wrap items-center justify-between gap-3 py-2.5"
+            key={requirement.id}
+          >
+            <div className="flex min-w-0 items-start gap-2.5">
+              {requirement.complete ? (
+                <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-[#00e599]" />
+              ) : (
+                <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-[#f59e0b]" />
+              )}
+              <div>
+                <p className="text-caption text-foreground">
+                  {requirement.title}
+                </p>
+                <p className="mt-0.5 text-label text-[#9ca3af]">
+                  {requirement.detail}
+                </p>
+              </div>
+            </div>
+            {requirement.action ? (
+              <Button
+                onClick={requirement.onAction}
+                size="xs"
+                type="button"
+                variant="ghost"
+              >
+                {requirement.action}
+                <ArrowRight className="size-3" />
+              </Button>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function TableSelection({
   tables,
   selectedTables,
+  ineligibleTables,
   onChange,
 }: {
   tables: string[];
   selectedTables: string[];
+  ineligibleTables: string[];
   onChange: (tables: string[]) => void;
 }) {
   const selected = new Set(selectedTables);
+  const ineligible = new Set(ineligibleTables);
+  const eligibleTables = tables.filter((table) => !ineligible.has(table));
   return (
     <div className="mb-4 rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1507,7 +2302,7 @@ function TableSelection({
         </div>
         <div className="flex gap-1">
           <Button
-            onClick={() => onChange(tables)}
+            onClick={() => onChange(eligibleTables)}
             size="xs"
             type="button"
             variant="ghost"
@@ -1525,34 +2320,57 @@ function TableSelection({
         </div>
       </div>
       <div className="mt-3 grid max-h-44 gap-1 overflow-y-auto sm:grid-cols-2">
-        {tables.map((table) => (
-          <label
-            className="flex cursor-pointer items-center gap-2 rounded-[3px] px-2 py-1.5 text-label text-foreground hover:bg-[#1a1b1b]"
-            key={table}
-          >
-            <input
-              checked={selected.has(table)}
-              className="size-3.5 accent-[#00e599]"
-              onChange={(event) =>
-                onChange(
-                  event.target.checked
-                    ? [...selectedTables, table]
-                    : selectedTables.filter((item) => item !== table),
-                )
+        {tables.map((table) => {
+          const unavailable = ineligible.has(table);
+          return (
+            <label
+              className={`flex items-center gap-2 rounded-[3px] px-2 py-1.5 text-label ${
+                unavailable
+                  ? "cursor-not-allowed text-[#9ca3af]"
+                  : "cursor-pointer text-foreground hover:bg-[#1a1b1b]"
+              }`}
+              key={table}
+              title={
+                unavailable
+                  ? "Unlogged tables cannot use logical replication"
+                  : table
               }
-              type="checkbox"
-            />
-            <span className="truncate font-mono" title={table}>
-              {table}
-            </span>
-          </label>
-        ))}
+            >
+              <input
+                checked={selected.has(table)}
+                className="size-3.5 accent-[#00e599]"
+                disabled={unavailable}
+                onChange={(event) =>
+                  onChange(
+                    event.target.checked
+                      ? [...selectedTables, table]
+                      : selectedTables.filter((item) => item !== table),
+                  )
+                }
+                type="checkbox"
+              />
+              <span className="min-w-0 flex-1 truncate font-mono">
+                {table}
+              </span>
+              {unavailable ? (
+                <span className="shrink-0 text-micro uppercase tracking-[0.06em] text-[#f59e0b]">
+                  Unlogged
+                </span>
+              ) : null}
+            </label>
+          );
+        })}
       </div>
     </div>
   );
 }
 
 function PreflightDetails({ p }: { p: ReplicationPreflight }) {
+  const tablesWithoutReplicaIdentity =
+    p.source.tablesWithoutReplicaIdentity ?? p.source.tablesWithoutPK;
+  const coveredNoPkTables =
+    p.source.tablesWithoutPK.length - tablesWithoutReplicaIdentity.length;
+
   return (
     <div className="grid gap-3 sm:grid-cols-2">
       <div className="rounded-[4px] border border-[#262727] bg-[#0c0d0d] p-4">
@@ -1569,12 +2387,42 @@ function PreflightDetails({ p }: { p: ReplicationPreflight }) {
           tone={p.source.roleHasReplication ? "ok" : "bad"}
         />
         <KV k="User tables" v={String(p.source.tableCount)} />
-        {p.source.tablesWithoutPK.length > 0 && (
+        {(p.source.unloggedTables?.length ?? 0) > 0 && (
           <KV
-            k="Tables w/o PK"
-            v={`${p.source.tablesWithoutPK.length} (updates/deletes won't replicate)`}
+            k="Unlogged tables"
+            v={`${p.source.unloggedTables?.length ?? 0} excluded`}
             tone="warn"
           />
+        )}
+        {tablesWithoutReplicaIdentity.length > 0 && (
+          <KV
+            k="Missing replica identity"
+            v={`${tablesWithoutReplicaIdentity.length} table${tablesWithoutReplicaIdentity.length === 1 ? "" : "s"}`}
+            tone="warn"
+          />
+        )}
+        {coveredNoPkTables > 0 && (
+          <KV
+            k="No-PK tables covered"
+            v={`${coveredNoPkTables} (FULL or unique index)`}
+            tone="ok"
+          />
+        )}
+        {tablesWithoutReplicaIdentity.length > 0 && (
+          <div className="mt-3 border-t border-[#262727] pt-3">
+            <p className="text-label text-[#9ca3af]">Affected tables</p>
+            <ul className="mt-2 max-h-28 space-y-1 overflow-y-auto">
+              {tablesWithoutReplicaIdentity.map((table) => (
+                <li
+                  className="truncate font-mono text-label text-[#f59e0b]"
+                  key={table}
+                  title={table}
+                >
+                  {table}
+                </li>
+              ))}
+            </ul>
+          </div>
         )}
         {p.source.tables?.length > 0 && (
           <details className="mt-3 border-t border-[#262727] pt-3">
@@ -2303,6 +3151,7 @@ WHERE pid = ${inspection.slot.activePid};`
           </label>
           {!activeOrphan ? (
             <Button
+              className="bg-[#ef4444] text-white opacity-100 hover:bg-[#dc2626] dark:bg-[#ef4444] dark:hover:bg-[#dc2626]"
               disabled={!confirmed || busy}
               onClick={onTeardown}
               size="lg"
@@ -2317,8 +3166,8 @@ WHERE pid = ${inspection.slot.activePid};`
                 <>
                   <Trash2 className="h-3.5 w-3.5" />
                   {setupRecovery
-                    ? "Clean up setup resources"
-                    : "Permanently stop replication"}
+                    ? "Yes, clean up setup resources"
+                    : "Yes, permanently stop replication"}
                 </>
               )}
             </Button>
@@ -2338,7 +3187,9 @@ WHERE pid = ${inspection.slot.activePid};`
             }`}
           >
             {result.cleanupComplete
-              ? "Teardown verified. No application-owned replication resources remain."
+              ? setupRecovery
+                ? "Setup recovery complete. No partial resources remain; Step 3 is ready to retry."
+                : "Teardown verified. No application-owned replication resources remain."
               : result.replicationStopped
                 ? `Replication subscription removed. Source cleanup is incomplete. Remaining resources: ${result.remainingResources.join(", ")}.`
                 : `Replication is not stopped. Remaining resources: ${result.remainingResources.join(", ")}.`}

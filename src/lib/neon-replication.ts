@@ -27,6 +27,7 @@ const DEFAULT_SUB = ADVISOR_SUBSCRIPTION;
 interface PostgresErrorLike {
   code?: string;
   message?: string;
+  detail?: string;
 }
 
 export class ReplicationSetupError extends Error {
@@ -43,9 +44,18 @@ export class ReplicationSetupError extends Error {
       error && typeof error === "object"
         ? (error as PostgresErrorLike)
         : { message: String(error) };
+    const safeDetail =
+      postgresError.detail &&
+      /^This operation is not supported for (?:unlogged|temporary) tables\.$/i.test(
+        postgresError.detail,
+      )
+        ? postgresError.detail
+        : null;
     super(
       sanitizeDatabaseError(
-        postgresError.message || "Unknown database error",
+        [postgresError.message || "Unknown database error", safeDetail]
+          .filter(Boolean)
+          .join(" "),
       ),
     );
     this.name = "ReplicationSetupError";
@@ -69,6 +79,7 @@ interface ReplicationTableRef {
   schema: string;
   table: string;
   qualifiedName: string;
+  persistence: "p" | "u" | "t";
 }
 
 /** Returns `host` and unpooled (`-pooler` removed) connection string. */
@@ -81,6 +92,10 @@ function quoteIdent(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
 }
 
+function quoteLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
 function tableName(table: Pick<ReplicationTableRef, "schema" | "table">): string {
   return `${table.schema}.${table.table}`;
 }
@@ -88,6 +103,7 @@ function tableName(table: Pick<ReplicationTableRef, "schema" | "table">): string
 async function resolveTableSelection(
   sourceConn: string,
   requestedTables?: string[],
+  options: { allowUnlogged?: boolean } = {},
 ): Promise<ReplicationTableRef[] | null> {
   if (requestedTables === undefined) return null;
   const requested = [...new Set(requestedTables.map((table) => table.trim()))];
@@ -98,8 +114,15 @@ async function resolveTableSelection(
   const src = new Client({ connectionString: unpool(sourceConn) });
   await src.connect();
   try {
-    const available = await src.query<{ schema: string; table: string }>(`
-      SELECT n.nspname AS schema, c.relname AS table
+    const available = await src.query<{
+      schema: string;
+      table: string;
+      persistence: "p" | "u" | "t";
+    }>(`
+      SELECT
+        n.nspname AS schema,
+        c.relname AS table,
+        c.relpersistence AS persistence
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind = 'r'
@@ -123,7 +146,14 @@ async function resolveTableSelection(
         `Selected table${missing.length === 1 ? "" : "s"} not found on source: ${missing.join(", ")}`,
       );
     }
-    return requested.map((name) => byName.get(name)!);
+    const selected = requested.map((name) => byName.get(name)!);
+    const unlogged = selected.filter((table) => table.persistence === "u");
+    if (!options.allowUnlogged && unlogged.length > 0) {
+      throw new Error(
+        `Unlogged tables cannot be published because they do not write WAL: ${unlogged.map((table) => table.qualifiedName).join(", ")}. Deselect them or convert them to LOGGED before retrying.`,
+      );
+    }
+    return selected;
   } finally {
     await src.end();
   }
@@ -144,6 +174,7 @@ export async function preflight(
   const selectedTables = await resolveTableSelection(
     sourceConn,
     requestedTables,
+    { allowUnlogged: true },
   );
   const selectedTableNames = selectedTables
     ? new Set(selectedTables.map((table) => table.qualifiedName))
@@ -163,8 +194,15 @@ export async function preflight(
       )
     ).rows[0];
 
-    const srcTables = await src.query<{ schema: string; table: string }>(`
-      SELECT n.nspname AS schema, c.relname AS table
+    const srcTables = await src.query<{
+      schema: string;
+      table: string;
+      persistence: "p" | "u" | "t";
+    }>(`
+      SELECT
+        n.nspname AS schema,
+        c.relname AS table,
+        c.relpersistence AS persistence
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind = 'r'
         AND n.nspname <> 'information_schema'
@@ -175,8 +213,15 @@ export async function preflight(
         )
       ORDER BY 1, 2
     `);
-    const noPK = await src.query<{ schema: string; table: string }>(`
-      SELECT n.nspname AS schema, c.relname AS table
+    const noPK = await src.query<{
+      schema: string;
+      table: string;
+      replica_identity: "d" | "n" | "f" | "i";
+    }>(`
+      SELECT
+        n.nspname AS schema,
+        c.relname AS table,
+        c.relreplident AS replica_identity
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind = 'r'
@@ -189,6 +234,33 @@ export async function preflight(
         AND NOT EXISTS (
           SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary
         )
+      ORDER BY 1, 2
+    `);
+    const generated = await src.query<{
+      schema: string;
+      table: string;
+      column: string;
+      generation_kind: "s" | "v";
+    }>(`
+      SELECT
+        n.nspname AS schema,
+        c.relname AS table,
+        a.attname AS column,
+        a.attgenerated AS generation_kind
+      FROM pg_attribute a
+      JOIN pg_class c ON c.oid = a.attrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind = 'r'
+        AND a.attnum > 0
+        AND NOT a.attisdropped
+        AND a.attgenerated <> ''
+        AND n.nspname <> 'information_schema'
+        AND n.nspname !~ '^pg_'
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.objid = c.oid AND d.deptype = 'e'
+        )
+      ORDER BY 1, 2, a.attnum
     `);
     const repRole = await src.query<{
       rolreplication: boolean;
@@ -230,11 +302,29 @@ export async function preflight(
           selectedTableNames.has(tableName(table)),
         )
       : srcTables.rows;
+    const sourceUnloggedTables = sourceTables.filter(
+      (table) => table.persistence === "u",
+    );
+    const replicationSourceTables = sourceTables.filter(
+      (table) => table.persistence === "p",
+    );
+    const replicationTableNames = new Set(
+      replicationSourceTables.map(tableName),
+    );
     const sourceTablesWithoutPK = selectedTableNames
       ? noPK.rows.filter((table) =>
-          selectedTableNames.has(tableName(table)),
+          replicationTableNames.has(tableName(table)),
         )
-      : noPK.rows;
+      : noPK.rows.filter((table) =>
+          replicationTableNames.has(tableName(table)),
+        );
+    const sourceGeneratedColumns = selectedTableNames
+      ? generated.rows.filter((column) =>
+          replicationTableNames.has(tableName(column)),
+        )
+      : generated.rows.filter((column) =>
+          replicationTableNames.has(tableName(column)),
+        );
     const walLevel = srcVersion.wal;
     const logicalEnabled = walLevel === "logical";
     const roleHasReplication = Boolean(
@@ -243,15 +333,35 @@ export async function preflight(
     );
     const tableCount = sourceTables.length;
     const tables = sourceTables.map(tableName);
+    const replicationTables = replicationSourceTables.map(tableName);
+    const unloggedTables = sourceUnloggedTables.map(tableName);
     const tablesWithoutPK = sourceTablesWithoutPK.map(tableName);
+    const tablesWithoutReplicaIdentity = sourceTablesWithoutPK
+      .filter(
+        (table) =>
+          table.replica_identity !== "f" && table.replica_identity !== "i",
+      )
+      .map(tableName);
+    const tablesWithReplicaIdentityFull = sourceTablesWithoutPK
+      .filter((table) => table.replica_identity === "f")
+      .map(tableName);
+    const generatedColumns = sourceGeneratedColumns.map((column) => ({
+      table: tableName(column),
+      column: column.column,
+      kind:
+        column.generation_kind === "v"
+          ? ("virtual" as const)
+          : ("stored" as const),
+    }));
     const targetTables = new Set(
       tgtTables.rows.map((r) => `${r.schema}.${r.table}`),
     );
-    const targetSchemaTableCount = selectedTableNames
-      ? tables.filter((table) => targetTables.has(table)).length
-      : targetTables.size;
+    const targetSchemaTableCount = replicationTables.filter((table) =>
+      targetTables.has(table),
+    ).length;
     const targetSchemaLoaded =
-      tableCount > 0 && tables.every((table) => targetTables.has(table));
+      replicationTables.length > 0 &&
+      replicationTables.every((table) => targetTables.has(table));
 
     const blockers: string[] = [];
     const warnings: string[] = [];
@@ -268,14 +378,27 @@ export async function preflight(
     if (tableCount === 0) {
       blockers.push("No user tables found on source.");
     }
-    if (!targetSchemaLoaded) {
+    if (!targetSchemaLoaded && replicationTables.length > 0) {
       warnings.push(
-        `Target schema has ${targetSchemaTableCount}/${tableCount} tables, schema copy will run automatically.`,
+        `Target schema has ${targetSchemaTableCount}/${replicationTables.length} tables, schema copy will run automatically.`,
       );
     }
-    if (tablesWithoutPK.length > 0) {
+    if (unloggedTables.length > 0) {
+      const message = `Unlogged tables cannot be published because they do not write WAL: ${unloggedTables.join(", ")}. Recreate them empty on the target, or convert them to LOGGED if their rows must migrate.`;
+      if (selectedTableNames) {
+        blockers.push(message);
+      } else {
+        warnings.push(`Excluded from logical replication. ${message}`);
+      }
+    }
+    if (tablesWithoutReplicaIdentity.length > 0) {
       warnings.push(
-        `${tablesWithoutPK.length} tables without PRIMARY KEY, updates/deletes won't replicate cleanly: ${tablesWithoutPK.slice(0, 5).join(", ")}${tablesWithoutPK.length > 5 ? "…" : ""}`,
+        `${tablesWithoutReplicaIdentity.length} tables without PRIMARY KEY or usable replica identity; updates/deletes won't replicate: ${tablesWithoutReplicaIdentity.slice(0, 5).join(", ")}${tablesWithoutReplicaIdentity.length > 5 ? "…" : ""}`,
+      );
+    }
+    if (generatedColumns.length > 0) {
+      warnings.push(
+        `The current publication does not transmit generated values. Schema copy will recreate these expressions so the target recomputes them: ${generatedColumns.map(({ table, column }) => `${table}.${column}`).join(", ")}`,
       );
     }
     if (existingSub.rows.length > 0) {
@@ -292,6 +415,10 @@ export async function preflight(
         tableCount,
         tables,
         tablesWithoutPK,
+        tablesWithoutReplicaIdentity,
+        tablesWithReplicaIdentityFull,
+        generatedColumns,
+        unloggedTables,
         roleHasReplication,
         rolname: srcVersion.user,
       },
@@ -315,6 +442,9 @@ export async function preflight(
 interface SchemaCopyReport {
   extensionsCreated: string[];
   extensionsFailed: { name: string; error: string; code?: string }[];
+  typesCreated: string[];
+  typesSkipped: string[];
+  typesFailed: { name: string; error: string; ddl: string; code?: string }[];
   tablesCreated: string[];
   tablesSkipped: string[];
   tablesFailed: { name: string; error: string; ddl: string; code?: string }[];
@@ -322,12 +452,895 @@ interface SchemaCopyReport {
   indexesFailed: { name: string; error: string }[];
 }
 
+interface SequenceColumnReference {
+  schema: string;
+  table: string;
+  column: string;
+}
+
+interface SourceSequenceDefinition {
+  schema: string;
+  name: string;
+  data_type: "smallint" | "integer" | "bigint";
+  start_value: string;
+  increment_by: string;
+  min_value: string;
+  max_value: string;
+  cache_size: string;
+  cycles: boolean;
+  owner_schema: string | null;
+  owner_table: string | null;
+  owner_column: string | null;
+  dependency_type: "a" | "i" | null;
+  default_references: SequenceColumnReference[];
+}
+
+interface UnresolvedSequenceDefault {
+  schema: string;
+  table: string;
+  column: string;
+  expression: string;
+}
+
+interface SourceTableInheritance {
+  parent_schema: string;
+  parent_table: string;
+  parent_kind: string;
+  child_schema: string;
+  child_table: string;
+  child_kind: string;
+  child_is_partition: boolean;
+  partition_bound: string | null;
+}
+
+interface SourceTableDefinition {
+  schema: string;
+  table: string;
+  relation_kind: "r" | "p";
+  partition_key: string | null;
+}
+
+function sequenceInteger(value: string, field: string): string {
+  if (!/^-?\d+$/.test(value)) {
+    throw new Error(`Invalid ${field} returned by PostgreSQL: ${value}`);
+  }
+  return value;
+}
+
+function qualifiedIdentifier(schema: string, name: string): string {
+  return `${quoteIdent(schema)}.${quoteIdent(name)}`;
+}
+
+function sequenceOptions(sequence: SourceSequenceDefinition): string {
+  const increment = sequenceInteger(sequence.increment_by, "sequence increment");
+  const min = sequenceInteger(sequence.min_value, "sequence minimum");
+  const max = sequenceInteger(sequence.max_value, "sequence maximum");
+  const start = sequenceInteger(sequence.start_value, "sequence start");
+  const cache = sequenceInteger(sequence.cache_size, "sequence cache");
+  return [
+    `INCREMENT BY ${increment}`,
+    `MINVALUE ${min}`,
+    `MAXVALUE ${max}`,
+    `START WITH ${start}`,
+    `CACHE ${cache}`,
+    sequence.cycles ? "CYCLE" : "NO CYCLE",
+  ].join(" ");
+}
+
+type PostgreSQLTypeKind = "b" | "c" | "d" | "e" | "m" | "p" | "r";
+
+interface SourceTypeCatalogRow {
+  oid: string;
+  schema: string;
+  type: string;
+  kind: PostgreSQLTypeKind;
+  category: string;
+  is_defined: boolean;
+  relation_kind: string | null;
+  element_oid: string;
+  array_oid: string;
+  base_oid: string;
+  extension_name: string | null;
+}
+
+interface SourceDomainDefinition {
+  oid: string;
+  base_type: string;
+  not_null: boolean;
+  default_expr: string | null;
+  collation_schema: string | null;
+  collation_name: string | null;
+  collation_extension: string | null;
+  constraints: { name: string; definition: string }[];
+}
+
+interface SourceCompositeAttribute {
+  type_oid: string;
+  position: number;
+  name: string;
+  formatted_type: string;
+  attribute_type_oid: string;
+  collation_schema: string | null;
+  collation_name: string | null;
+  collation_extension: string | null;
+}
+
+interface SourceRangeDefinition {
+  type_oid: string;
+  subtype_oid: string;
+  subtype: string;
+  opclass_schema: string;
+  opclass_name: string;
+  opclass_extension: string | null;
+  collation_schema: string | null;
+  collation_name: string | null;
+  collation_extension: string | null;
+  canonical_schema: string | null;
+  canonical_name: string | null;
+  canonical_extension: string | null;
+  subdiff_schema: string | null;
+  subdiff_name: string | null;
+  subdiff_extension: string | null;
+  multirange_oid: string;
+  multirange_schema: string;
+  multirange_name: string;
+}
+
+interface CustomTypeDefinition {
+  oid: string;
+  schema: string;
+  type: string;
+  requiredSchemas: string[];
+  dependencies: string[];
+  ddl: string;
+}
+
+interface CustomTypePlan {
+  definitions: CustomTypeDefinition[];
+  skipped: string[];
+  failures: { name: string; error: string; ddl: string }[];
+}
+
+function isSystemSchema(schema: string): boolean {
+  return schema === "information_schema" || schema.startsWith("pg_");
+}
+
+function sourceTypeName(
+  type: Pick<SourceTypeCatalogRow, "schema" | "type">,
+): string {
+  return `${type.schema}.${type.type}`;
+}
+
+function supportingObjectIsPortable(
+  schema: string | null,
+  extensionName: string | null,
+): boolean {
+  return schema === null || schema === "pg_catalog" || extensionName !== null;
+}
+
+function isGeneratedArrayType(
+  type: SourceTypeCatalogRow,
+  typesByOid: Map<string, SourceTypeCatalogRow>,
+): boolean {
+  const elementType = typesByOid.get(type.element_oid);
+  return (
+    type.kind === "b" &&
+    type.element_oid !== "0" &&
+    elementType?.array_oid === type.oid
+  );
+}
+
+async function planCustomTypes(
+  source: Client,
+  target: Client,
+  selectedTableNames: Set<string> | null,
+): Promise<CustomTypePlan> {
+  const catalog = await source.query<SourceTypeCatalogRow>(`
+    SELECT
+      type_catalog.oid::text AS oid,
+      type_namespace.nspname AS "schema",
+      type_catalog.typname AS "type",
+      type_catalog.typtype AS kind,
+      type_catalog.typcategory AS category,
+      type_catalog.typisdefined AS is_defined,
+      relation_catalog.relkind AS relation_kind,
+      type_catalog.typelem::text AS element_oid,
+      type_catalog.typarray::text AS array_oid,
+      type_catalog.typbasetype::text AS base_oid,
+      owned_extension.extname AS extension_name
+    FROM pg_type type_catalog
+    JOIN pg_namespace type_namespace
+      ON type_namespace.oid = type_catalog.typnamespace
+    LEFT JOIN pg_class relation_catalog
+      ON relation_catalog.oid = type_catalog.typrelid
+    LEFT JOIN LATERAL (
+      SELECT extension_catalog.extname
+      FROM pg_depend extension_dependency
+      JOIN pg_extension extension_catalog
+        ON extension_catalog.oid = extension_dependency.refobjid
+      WHERE extension_dependency.classid = 'pg_type'::regclass
+        AND extension_dependency.objid = type_catalog.oid
+        AND extension_dependency.objsubid = 0
+        AND extension_dependency.refclassid = 'pg_extension'::regclass
+        AND extension_dependency.deptype = 'e'
+      LIMIT 1
+    ) owned_extension ON true
+  `);
+  const typesByOid = new Map(catalog.rows.map((type) => [type.oid, type]));
+
+  const seeds = await source.query<{ oid: string }>(
+    `SELECT DISTINCT attribute_catalog.atttypid::text AS oid
+     FROM pg_attribute attribute_catalog
+     JOIN pg_class table_catalog
+       ON table_catalog.oid = attribute_catalog.attrelid
+     JOIN pg_namespace table_namespace
+       ON table_namespace.oid = table_catalog.relnamespace
+     WHERE table_catalog.relkind = 'r'
+       AND attribute_catalog.attnum > 0
+       AND NOT attribute_catalog.attisdropped
+       AND table_namespace.nspname <> 'information_schema'
+       AND table_namespace.nspname !~ '^pg_'
+       AND NOT EXISTS (
+         SELECT 1
+         FROM pg_depend extension_dependency
+         WHERE extension_dependency.classid = 'pg_class'::regclass
+           AND extension_dependency.objid = table_catalog.oid
+           AND extension_dependency.deptype = 'e'
+       )
+       AND (
+         $1::text[] IS NULL
+         OR (
+           table_namespace.nspname || '.' || table_catalog.relname
+         ) = ANY($1::text[])
+       )
+     ORDER BY 1`,
+    [selectedTableNames ? [...selectedTableNames] : null],
+  );
+
+  const enumRows = await source.query<{ oid: string; labels: string[] }>(`
+    SELECT
+      type_catalog.oid::text AS oid,
+      COALESCE(
+        json_agg(enum_catalog.enumlabel::text ORDER BY enum_catalog.enumsortorder)
+          FILTER (WHERE enum_catalog.enumlabel IS NOT NULL),
+        '[]'::json
+      ) AS labels
+    FROM pg_type type_catalog
+    JOIN pg_namespace type_namespace
+      ON type_namespace.oid = type_catalog.typnamespace
+    LEFT JOIN pg_enum enum_catalog
+      ON enum_catalog.enumtypid = type_catalog.oid
+    WHERE type_catalog.typtype = 'e'
+      AND type_namespace.nspname <> 'information_schema'
+      AND type_namespace.nspname !~ '^pg_'
+    GROUP BY type_catalog.oid
+  `);
+  const enumLabelsByOid = new Map(
+    enumRows.rows.map((type) => [type.oid, type.labels]),
+  );
+
+  const domainRows = await source.query<SourceDomainDefinition>(`
+    SELECT
+      type_catalog.oid::text AS oid,
+      pg_catalog.format_type(
+        type_catalog.typbasetype,
+        type_catalog.typtypmod
+      ) AS base_type,
+      type_catalog.typnotnull AS not_null,
+      pg_get_expr(type_catalog.typdefaultbin, 0) AS default_expr,
+      collation_namespace.nspname AS collation_schema,
+      collation_catalog.collname AS collation_name,
+      collation_extension.extname AS collation_extension,
+      COALESCE(
+        (
+          SELECT json_agg(
+            json_build_object(
+              'name', domain_constraint.conname,
+              'definition', pg_get_constraintdef(domain_constraint.oid, true)
+            )
+            ORDER BY domain_constraint.conname
+          )
+          FROM pg_constraint domain_constraint
+          WHERE domain_constraint.contypid = type_catalog.oid
+            AND domain_constraint.contype = 'c'
+        ),
+        '[]'::json
+      ) AS constraints
+    FROM pg_type type_catalog
+    JOIN pg_namespace type_namespace
+      ON type_namespace.oid = type_catalog.typnamespace
+    LEFT JOIN pg_collation collation_catalog
+      ON collation_catalog.oid = type_catalog.typcollation
+    LEFT JOIN pg_namespace collation_namespace
+      ON collation_namespace.oid = collation_catalog.collnamespace
+    LEFT JOIN LATERAL (
+      SELECT extension_catalog.extname
+      FROM pg_depend extension_dependency
+      JOIN pg_extension extension_catalog
+        ON extension_catalog.oid = extension_dependency.refobjid
+      WHERE extension_dependency.classid = 'pg_collation'::regclass
+        AND extension_dependency.objid = collation_catalog.oid
+        AND extension_dependency.objsubid = 0
+        AND extension_dependency.refclassid = 'pg_extension'::regclass
+        AND extension_dependency.deptype = 'e'
+      LIMIT 1
+    ) collation_extension ON true
+    WHERE type_catalog.typtype = 'd'
+      AND type_namespace.nspname <> 'information_schema'
+      AND type_namespace.nspname !~ '^pg_'
+  `);
+  const domainsByOid = new Map(
+    domainRows.rows.map((type) => [type.oid, type]),
+  );
+
+  const compositeRows = await source.query<SourceCompositeAttribute>(`
+    SELECT
+      type_catalog.oid::text AS type_oid,
+      attribute_catalog.attnum AS position,
+      attribute_catalog.attname AS name,
+      pg_catalog.format_type(
+        attribute_catalog.atttypid,
+        attribute_catalog.atttypmod
+      ) AS formatted_type,
+      attribute_catalog.atttypid::text AS attribute_type_oid,
+      collation_namespace.nspname AS collation_schema,
+      collation_catalog.collname AS collation_name,
+      collation_extension.extname AS collation_extension
+    FROM pg_type type_catalog
+    JOIN pg_namespace type_namespace
+      ON type_namespace.oid = type_catalog.typnamespace
+    JOIN pg_class relation_catalog
+      ON relation_catalog.oid = type_catalog.typrelid
+    JOIN pg_attribute attribute_catalog
+      ON attribute_catalog.attrelid = type_catalog.typrelid
+    LEFT JOIN pg_collation collation_catalog
+      ON collation_catalog.oid = attribute_catalog.attcollation
+    LEFT JOIN pg_namespace collation_namespace
+      ON collation_namespace.oid = collation_catalog.collnamespace
+    LEFT JOIN LATERAL (
+      SELECT extension_catalog.extname
+      FROM pg_depend extension_dependency
+      JOIN pg_extension extension_catalog
+        ON extension_catalog.oid = extension_dependency.refobjid
+      WHERE extension_dependency.classid = 'pg_collation'::regclass
+        AND extension_dependency.objid = collation_catalog.oid
+        AND extension_dependency.objsubid = 0
+        AND extension_dependency.refclassid = 'pg_extension'::regclass
+        AND extension_dependency.deptype = 'e'
+      LIMIT 1
+    ) collation_extension ON true
+    WHERE type_catalog.typtype = 'c'
+      AND relation_catalog.relkind = 'c'
+      AND attribute_catalog.attnum > 0
+      AND NOT attribute_catalog.attisdropped
+      AND type_namespace.nspname <> 'information_schema'
+      AND type_namespace.nspname !~ '^pg_'
+    ORDER BY type_catalog.oid, attribute_catalog.attnum
+  `);
+  const compositeAttributesByOid = new Map<
+    string,
+    SourceCompositeAttribute[]
+  >();
+  for (const attribute of compositeRows.rows) {
+    const attributes =
+      compositeAttributesByOid.get(attribute.type_oid) ?? [];
+    attributes.push(attribute);
+    compositeAttributesByOid.set(attribute.type_oid, attributes);
+  }
+
+  const rangeRows = await source.query<SourceRangeDefinition>(`
+    SELECT
+      range_catalog.rngtypid::text AS type_oid,
+      range_catalog.rngsubtype::text AS subtype_oid,
+      pg_catalog.format_type(range_catalog.rngsubtype, NULL) AS subtype,
+      opclass_namespace.nspname AS opclass_schema,
+      opclass_catalog.opcname AS opclass_name,
+      opclass_extension.extname AS opclass_extension,
+      collation_namespace.nspname AS collation_schema,
+      collation_catalog.collname AS collation_name,
+      collation_extension.extname AS collation_extension,
+      canonical_namespace.nspname AS canonical_schema,
+      canonical_function.proname AS canonical_name,
+      canonical_extension.extname AS canonical_extension,
+      subdiff_namespace.nspname AS subdiff_schema,
+      subdiff_function.proname AS subdiff_name,
+      subdiff_extension.extname AS subdiff_extension,
+      range_catalog.rngmultitypid::text AS multirange_oid,
+      multirange_namespace.nspname AS multirange_schema,
+      multirange_type.typname AS multirange_name
+    FROM pg_range range_catalog
+    JOIN pg_type range_type
+      ON range_type.oid = range_catalog.rngtypid
+    JOIN pg_namespace range_namespace
+      ON range_namespace.oid = range_type.typnamespace
+    JOIN pg_type multirange_type
+      ON multirange_type.oid = range_catalog.rngmultitypid
+    JOIN pg_namespace multirange_namespace
+      ON multirange_namespace.oid = multirange_type.typnamespace
+    JOIN pg_opclass opclass_catalog
+      ON opclass_catalog.oid = range_catalog.rngsubopc
+    JOIN pg_namespace opclass_namespace
+      ON opclass_namespace.oid = opclass_catalog.opcnamespace
+    LEFT JOIN pg_collation collation_catalog
+      ON collation_catalog.oid = range_catalog.rngcollation
+    LEFT JOIN pg_namespace collation_namespace
+      ON collation_namespace.oid = collation_catalog.collnamespace
+    LEFT JOIN pg_proc canonical_function
+      ON canonical_function.oid = range_catalog.rngcanonical
+    LEFT JOIN pg_namespace canonical_namespace
+      ON canonical_namespace.oid = canonical_function.pronamespace
+    LEFT JOIN pg_proc subdiff_function
+      ON subdiff_function.oid = range_catalog.rngsubdiff
+    LEFT JOIN pg_namespace subdiff_namespace
+      ON subdiff_namespace.oid = subdiff_function.pronamespace
+    LEFT JOIN LATERAL (
+      SELECT extension_catalog.extname
+      FROM pg_depend extension_dependency
+      JOIN pg_extension extension_catalog
+        ON extension_catalog.oid = extension_dependency.refobjid
+      WHERE extension_dependency.classid = 'pg_opclass'::regclass
+        AND extension_dependency.objid = opclass_catalog.oid
+        AND extension_dependency.refclassid = 'pg_extension'::regclass
+        AND extension_dependency.deptype = 'e'
+      LIMIT 1
+    ) opclass_extension ON true
+    LEFT JOIN LATERAL (
+      SELECT extension_catalog.extname
+      FROM pg_depend extension_dependency
+      JOIN pg_extension extension_catalog
+        ON extension_catalog.oid = extension_dependency.refobjid
+      WHERE extension_dependency.classid = 'pg_collation'::regclass
+        AND extension_dependency.objid = collation_catalog.oid
+        AND extension_dependency.refclassid = 'pg_extension'::regclass
+        AND extension_dependency.deptype = 'e'
+      LIMIT 1
+    ) collation_extension ON true
+    LEFT JOIN LATERAL (
+      SELECT extension_catalog.extname
+      FROM pg_depend extension_dependency
+      JOIN pg_extension extension_catalog
+        ON extension_catalog.oid = extension_dependency.refobjid
+      WHERE extension_dependency.classid = 'pg_proc'::regclass
+        AND extension_dependency.objid = canonical_function.oid
+        AND extension_dependency.refclassid = 'pg_extension'::regclass
+        AND extension_dependency.deptype = 'e'
+      LIMIT 1
+    ) canonical_extension ON true
+    LEFT JOIN LATERAL (
+      SELECT extension_catalog.extname
+      FROM pg_depend extension_dependency
+      JOIN pg_extension extension_catalog
+        ON extension_catalog.oid = extension_dependency.refobjid
+      WHERE extension_dependency.classid = 'pg_proc'::regclass
+        AND extension_dependency.objid = subdiff_function.oid
+        AND extension_dependency.refclassid = 'pg_extension'::regclass
+        AND extension_dependency.deptype = 'e'
+      LIMIT 1
+    ) subdiff_extension ON true
+    WHERE range_namespace.nspname <> 'information_schema'
+      AND range_namespace.nspname !~ '^pg_'
+  `);
+  const rangesByOid = new Map(
+    rangeRows.rows.map((range) => [range.type_oid, range]),
+  );
+  const rangeOidByMultirangeOid = new Map(
+    rangeRows.rows.map((range) => [range.multirange_oid, range.type_oid]),
+  );
+
+  const existingTypes = new Set(
+    (
+      await target.query<{ schema: string; type: string }>(`
+        SELECT n.nspname AS schema, t.typname AS type
+        FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+      `)
+    ).rows.map(({ schema, type }) => `${schema}.${type}`),
+  );
+
+  const required = new Set<string>();
+  const visited = new Set<string>();
+  const skipped = new Set<string>();
+  const failuresByOid = new Map<
+    string,
+    { name: string; error: string; ddl: string }
+  >();
+
+  const rawDependencies = (type: SourceTypeCatalogRow): string[] => {
+    if (type.kind === "d") return type.base_oid === "0" ? [] : [type.base_oid];
+    if (type.kind === "c") {
+      return (compositeAttributesByOid.get(type.oid) ?? []).map(
+        (attribute) => attribute.attribute_type_oid,
+      );
+    }
+    if (type.kind === "r") {
+      const range = rangesByOid.get(type.oid);
+      return range ? [range.subtype_oid] : [];
+    }
+    return [];
+  };
+
+  const failType = (type: SourceTypeCatalogRow, error: string) => {
+    required.delete(type.oid);
+    failuresByOid.set(type.oid, {
+      name: sourceTypeName(type),
+      error,
+      ddl: `CREATE TYPE ${qualifiedIdentifier(type.schema, type.type)} (...)`,
+    });
+  };
+
+  const requireType = (oid: string) => {
+    if (oid === "0" || visited.has(oid)) return;
+    visited.add(oid);
+    const type = typesByOid.get(oid);
+    if (!type) {
+      failuresByOid.set(oid, {
+        name: `type OID ${oid}`,
+        error: `PostgreSQL returned no catalog metadata for required type OID ${oid}.`,
+        ddl: `-- unresolved type OID ${oid}`,
+      });
+      return;
+    }
+    const qualifiedName = sourceTypeName(type);
+    if (isSystemSchema(type.schema)) return;
+    if (isGeneratedArrayType(type, typesByOid)) {
+      requireType(type.element_oid);
+      return;
+    }
+    if (existingTypes.has(qualifiedName)) {
+      skipped.add(qualifiedName);
+      return;
+    }
+    if (type.extension_name) {
+      failType(
+        type,
+        `Extension ${type.extension_name} owns this type, but installing that extension did not create it on the target.`,
+      );
+      return;
+    }
+    if (!type.is_defined) {
+      failType(
+        type,
+        "This is an undefined shell type. Complete its definition on the source or create the matching type on the target.",
+      );
+      return;
+    }
+    if (type.kind === "m") {
+      const rangeOid = rangeOidByMultirangeOid.get(type.oid);
+      if (!rangeOid) {
+        failType(type, "No owning range type was found for this multirange.");
+        return;
+      }
+      const rangeType = typesByOid.get(rangeOid);
+      if (
+        rangeType &&
+        existingTypes.has(sourceTypeName(rangeType)) &&
+        !existingTypes.has(qualifiedName)
+      ) {
+        failType(
+          type,
+          `The target already has range ${sourceTypeName(rangeType)}, but it does not provide the source multirange name ${qualifiedName}. Recreate the range with the matching MULTIRANGE_TYPE_NAME.`,
+        );
+        return;
+      }
+      requireType(rangeOid);
+      return;
+    }
+    if (type.kind === "b") {
+      failType(
+        type,
+        "User-defined base types require their input/output functions or native extension library and cannot be recreated safely. Install the owning extension or create the matching type on the target.",
+      );
+      return;
+    }
+    if (type.kind === "p") {
+      failType(
+        type,
+        "User-defined pseudo-types cannot be recreated by the migration assistant. Create the matching type on the target.",
+      );
+      return;
+    }
+    if (type.kind === "c" && type.relation_kind !== "c") {
+      failType(
+        type,
+        "This is a table row type rather than a standalone composite type. Create its defining table on the target before retrying.",
+      );
+      return;
+    }
+    if (!["c", "d", "e", "r"].includes(type.kind)) {
+      failType(
+        type,
+        `PostgreSQL type kind ${type.kind} is not supported by schema copy.`,
+      );
+      return;
+    }
+
+    if (type.kind === "e") {
+      const labels = enumLabelsByOid.get(type.oid);
+      if (!Array.isArray(labels)) {
+        failType(type, "PostgreSQL did not return enum labels as an array.");
+        return;
+      }
+    } else if (type.kind === "d") {
+      const domain = domainsByOid.get(type.oid);
+      if (!domain) {
+        failType(type, "PostgreSQL returned no domain definition.");
+        return;
+      }
+      if (
+        !supportingObjectIsPortable(
+          domain.collation_schema,
+          domain.collation_extension,
+        )
+      ) {
+        failType(
+          type,
+          `Domain collation ${domain.collation_schema}.${domain.collation_name} is not built in or extension-owned. Create the matching domain on the target before retrying.`,
+        );
+        return;
+      }
+    } else if (type.kind === "c") {
+      const unsupportedCollation = (
+        compositeAttributesByOid.get(type.oid) ?? []
+      ).find(
+        (attribute) =>
+          !supportingObjectIsPortable(
+            attribute.collation_schema,
+            attribute.collation_extension,
+          ),
+      );
+      if (unsupportedCollation) {
+        failType(
+          type,
+          `Composite attribute ${unsupportedCollation.name} uses collation ${unsupportedCollation.collation_schema}.${unsupportedCollation.collation_name}, which is not built in or extension-owned. Create the matching composite type on the target before retrying.`,
+        );
+        return;
+      }
+    } else if (type.kind === "r") {
+      const range = rangesByOid.get(type.oid);
+      if (!range) {
+        failType(type, "PostgreSQL returned no pg_range definition.");
+        return;
+      }
+      const unsupportedObject = [
+        {
+          label: "operator class",
+          schema: range.opclass_schema,
+          name: range.opclass_name,
+          extension: range.opclass_extension,
+        },
+        {
+          label: "collation",
+          schema: range.collation_schema,
+          name: range.collation_name,
+          extension: range.collation_extension,
+        },
+        {
+          label: "canonical function",
+          schema: range.canonical_schema,
+          name: range.canonical_name,
+          extension: range.canonical_extension,
+        },
+        {
+          label: "subtype difference function",
+          schema: range.subdiff_schema,
+          name: range.subdiff_name,
+          extension: range.subdiff_extension,
+        },
+      ].find(
+        (object) =>
+          !supportingObjectIsPortable(object.schema, object.extension),
+      );
+      if (unsupportedObject) {
+        failType(
+          type,
+          `Range ${unsupportedObject.label} ${unsupportedObject.schema}.${unsupportedObject.name} is not built in or extension-owned. Create the supporting object and matching range on the target before retrying.`,
+        );
+        return;
+      }
+    }
+
+    required.add(type.oid);
+    for (const dependency of rawDependencies(type)) requireType(dependency);
+  };
+
+  for (const seed of seeds.rows) requireType(seed.oid);
+
+  const unsupportedDependency = (
+    oid: string,
+    seen = new Set<string>(),
+  ): string | null => {
+    if (oid === "0" || seen.has(oid)) return null;
+    seen.add(oid);
+    if (failuresByOid.has(oid)) return oid;
+    const type = typesByOid.get(oid);
+    if (!type) return oid;
+    if (isSystemSchema(type.schema)) return null;
+    if (isGeneratedArrayType(type, typesByOid)) {
+      return unsupportedDependency(type.element_oid, seen);
+    }
+    if (existingTypes.has(sourceTypeName(type))) return null;
+    if (type.kind === "m") {
+      const rangeOid = rangeOidByMultirangeOid.get(type.oid);
+      return rangeOid ? unsupportedDependency(rangeOid, seen) : type.oid;
+    }
+    return null;
+  };
+
+  let dependenciesChanged = true;
+  while (dependenciesChanged) {
+    dependenciesChanged = false;
+    for (const oid of [...required]) {
+      const type = typesByOid.get(oid);
+      if (!type) continue;
+      const unavailable = rawDependencies(type)
+        .map((dependency) => unsupportedDependency(dependency))
+        .find((dependency): dependency is string => dependency !== null);
+      if (!unavailable) continue;
+      const failedDependency = typesByOid.get(unavailable);
+      failType(
+        type,
+        `Depends on unsupported custom type ${failedDependency ? sourceTypeName(failedDependency) : unavailable}.`,
+      );
+      dependenciesChanged = true;
+    }
+  }
+
+  const explicitDependencies = (
+    oid: string,
+    result = new Set<string>(),
+    seen = new Set<string>(),
+  ): Set<string> => {
+    if (oid === "0" || seen.has(oid)) return result;
+    seen.add(oid);
+    if (required.has(oid)) {
+      result.add(oid);
+      return result;
+    }
+    const type = typesByOid.get(oid);
+    if (!type) return result;
+    if (isGeneratedArrayType(type, typesByOid)) {
+      return explicitDependencies(type.element_oid, result, seen);
+    }
+    if (type.kind === "m") {
+      const rangeOid = rangeOidByMultirangeOid.get(type.oid);
+      if (rangeOid) explicitDependencies(rangeOid, result, seen);
+    }
+    return result;
+  };
+
+  const definitionsByOid = new Map<string, CustomTypeDefinition>();
+  for (const oid of required) {
+    const type = typesByOid.get(oid);
+    if (!type) continue;
+    const dependencies = [
+      ...new Set(
+        rawDependencies(type).flatMap((dependency) => [
+          ...explicitDependencies(dependency),
+        ]),
+      ),
+    ].filter((dependency) => dependency !== oid);
+    let ddl: string;
+    if (type.kind === "e") {
+      const labels = enumLabelsByOid.get(type.oid) ?? [];
+      ddl = `CREATE TYPE ${qualifiedIdentifier(type.schema, type.type)} AS ENUM (${labels.map(quoteLiteral).join(", ")})`;
+    } else if (type.kind === "d") {
+      const domain = domainsByOid.get(type.oid)!;
+      const collation =
+        domain.collation_schema && domain.collation_name
+          ? ` COLLATE ${qualifiedIdentifier(domain.collation_schema, domain.collation_name)}`
+          : "";
+      const defaultClause = domain.default_expr
+        ? ` DEFAULT ${domain.default_expr}`
+        : "";
+      const notNullClause = domain.not_null ? " NOT NULL" : "";
+      const constraints = Array.isArray(domain.constraints)
+        ? domain.constraints
+            .map(
+              (constraint) =>
+                ` CONSTRAINT ${quoteIdent(constraint.name)} ${constraint.definition}`,
+            )
+            .join("")
+        : "";
+      ddl =
+        `CREATE DOMAIN ${qualifiedIdentifier(type.schema, type.type)} ` +
+        `AS ${domain.base_type}${collation}${defaultClause}${notNullClause}${constraints}`;
+    } else if (type.kind === "c") {
+      const attributes = compositeAttributesByOid.get(type.oid) ?? [];
+      const attributeDefinitions = attributes.map((attribute) => {
+        const collation =
+          attribute.collation_schema && attribute.collation_name
+            ? ` COLLATE ${qualifiedIdentifier(attribute.collation_schema, attribute.collation_name)}`
+            : "";
+        return `${quoteIdent(attribute.name)} ${attribute.formatted_type}${collation}`;
+      });
+      ddl =
+        `CREATE TYPE ${qualifiedIdentifier(type.schema, type.type)} AS (` +
+        `${attributeDefinitions.join(", ")})`;
+    } else {
+      const range = rangesByOid.get(type.oid)!;
+      const options = [
+        `SUBTYPE = ${range.subtype}`,
+        `SUBTYPE_OPCLASS = ${qualifiedIdentifier(range.opclass_schema, range.opclass_name)}`,
+        ...(range.collation_schema && range.collation_name
+          ? [
+              `COLLATION = ${qualifiedIdentifier(range.collation_schema, range.collation_name)}`,
+            ]
+          : []),
+        ...(range.canonical_schema && range.canonical_name
+          ? [
+              `CANONICAL = ${qualifiedIdentifier(range.canonical_schema, range.canonical_name)}`,
+            ]
+          : []),
+        ...(range.subdiff_schema && range.subdiff_name
+          ? [
+              `SUBTYPE_DIFF = ${qualifiedIdentifier(range.subdiff_schema, range.subdiff_name)}`,
+            ]
+          : []),
+        `MULTIRANGE_TYPE_NAME = ${qualifiedIdentifier(range.multirange_schema, range.multirange_name)}`,
+      ];
+      ddl =
+        `CREATE TYPE ${qualifiedIdentifier(type.schema, type.type)} ` +
+        `AS RANGE (${options.join(", ")})`;
+    }
+    definitionsByOid.set(oid, {
+      oid,
+      schema: type.schema,
+      type: type.type,
+      requiredSchemas:
+        type.kind === "r"
+          ? [
+              type.schema,
+              rangesByOid.get(type.oid)!.multirange_schema,
+            ]
+          : [type.schema],
+      dependencies,
+      ddl,
+    });
+  }
+
+  const remaining = new Map(definitionsByOid);
+  const ordered: CustomTypeDefinition[] = [];
+  while (remaining.size > 0) {
+    const ready = [...remaining.values()]
+      .filter((definition) =>
+        definition.dependencies.every(
+          (dependency) => !remaining.has(dependency),
+        ),
+      )
+      .sort((a, b) =>
+        `${a.schema}.${a.type}`.localeCompare(`${b.schema}.${b.type}`),
+      );
+    if (ready.length === 0) {
+      for (const definition of remaining.values()) {
+        const type = typesByOid.get(definition.oid)!;
+        failType(
+          type,
+          `Custom type dependency cycle detected among ${[...remaining.values()]
+            .map((item) => `${item.schema}.${item.type}`)
+            .join(", ")}.`,
+        );
+      }
+      break;
+    }
+    for (const definition of ready) {
+      ordered.push(definition);
+      remaining.delete(definition.oid);
+    }
+  }
+
+  return {
+    definitions: ordered,
+    skipped: [...skipped].sort(),
+    failures: [...failuresByOid.values()],
+  };
+}
+
 /** Copy schema from source to target via pg_catalog introspection.
     Uses pg_catalog.format_type() (proper SQL types like "character varying(50)",
     "timestamp with time zone[]") so the DDL round-trips correctly across
-    PG14 → PG17. Returns a detailed report so failures surface to the UI.
+    PG14 → PG18. Returns a detailed report so failures surface to the UI.
     For absolute pg_dump fidelity, run `pg_dump --schema-only` out of band. */
-async function copySchemaIfNeeded(
+export async function copySchemaIfNeeded(
   sourceConn: string,
   targetConn: string,
   selectedTables: ReplicationTableRef[] | null,
@@ -335,6 +1348,9 @@ async function copySchemaIfNeeded(
   const report: SchemaCopyReport = {
     extensionsCreated: [],
     extensionsFailed: [],
+    typesCreated: [],
+    typesSkipped: [],
+    typesFailed: [],
     tablesCreated: [],
     tablesSkipped: [],
     tablesFailed: [],
@@ -346,17 +1362,25 @@ async function copySchemaIfNeeded(
   const tgt = new Client({ connectionString: unpool(targetConn) });
   await Promise.all([src.connect(), tgt.connect()]);
   try {
+    // Force catalog deparsers such as format_type() and pg_get_expr() to
+    // schema-qualify user-defined dependencies.
+    await Promise.all([
+      src.query("SET search_path TO pg_catalog"),
+      tgt.query("SET search_path TO pg_catalog"),
+    ]);
+
     const selectedTableNames = selectedTables
       ? new Set(selectedTables.map((table) => table.qualifiedName))
+      : null;
+    const selectedSchemas = selectedTables
+      ? [...new Set(selectedTables.map((table) => table.schema))]
       : null;
 
     // 1. User-defined schemas. Logical replication is database-wide, not
     //    limited to `public`, so preserve every non-system schema containing
     //    a user table or sequence.
-    const schemas = selectedTables
-      ? [...new Set(selectedTables.map((table) => table.schema))].map(
-          (schema) => ({ schema }),
-        )
+    const schemas = selectedSchemas
+      ? selectedSchemas.map((schema) => ({ schema }))
       : (
           await src.query<{ schema: string }>(`
             SELECT DISTINCT n.nspname AS schema
@@ -388,13 +1412,38 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 2. Extensions
-    const exts = await src.query<{ extname: string }>(
-      "SELECT extname FROM pg_extension WHERE extname NOT IN ('plpgsql') ORDER BY extname",
-    );
+    // 2. Extensions. Preserve the source installation schema so extension
+    //    types and functions resolve the same way when custom types are copied.
+    const exts = await src.query<{ extname: string; schema: string }>(`
+      SELECT e.extname, n.nspname AS schema
+      FROM pg_extension e
+      JOIN pg_namespace n ON n.oid = e.extnamespace
+      WHERE e.extname <> 'plpgsql'
+      ORDER BY e.extname
+    `);
     for (const e of exts.rows) {
       try {
-        await tgt.query(`CREATE EXTENSION IF NOT EXISTS "${e.extname}"`);
+        await tgt.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(e.schema)}`);
+        const installed = await tgt.query<{ schema: string }>(
+          `SELECT n.nspname AS schema
+           FROM pg_extension x
+           JOIN pg_namespace n ON n.oid = x.extnamespace
+           WHERE x.extname = $1`,
+          [e.extname],
+        );
+        if (
+          installed.rows[0] &&
+          installed.rows[0].schema !== e.schema
+        ) {
+          throw new Error(
+            `Extension is already installed in schema ${installed.rows[0].schema}; source uses ${e.schema}.`,
+          );
+        }
+        if (installed.rows.length === 0) {
+          await tgt.query(
+            `CREATE EXTENSION ${quoteIdent(e.extname)} WITH SCHEMA ${quoteIdent(e.schema)}`,
+          );
+        }
         report.extensionsCreated.push(e.extname);
       } catch (err) {
         report.extensionsFailed.push({
@@ -408,63 +1457,431 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 3. Sequences first, column defaults like nextval('foo_id_seq'::regclass)
-    //    will fail if the sequence doesn't exist on the target.
-    const sequences = await src.query<{
-      schema: string;
-      seq: string;
-      owner_schema: string | null;
-      owner_table: string | null;
-    }>(`
-      SELECT DISTINCT
-        n.nspname AS schema,
-        c.relname AS seq,
-        COALESCE(owned_ns.nspname, default_ns.nspname) AS owner_schema,
-        COALESCE(owned_table.relname, default_table.relname) AS owner_table
-      FROM pg_class c
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-      LEFT JOIN pg_depend owned_dep
-        ON owned_dep.objid = c.oid
-       AND owned_dep.classid = 'pg_class'::regclass
-       AND owned_dep.refclassid = 'pg_class'::regclass
-       AND owned_dep.deptype IN ('a', 'i')
-      LEFT JOIN pg_class owned_table ON owned_table.oid = owned_dep.refobjid
-      LEFT JOIN pg_namespace owned_ns ON owned_ns.oid = owned_table.relnamespace
-      LEFT JOIN pg_depend default_dep
-        ON default_dep.refobjid = c.oid
-       AND default_dep.classid = 'pg_attrdef'::regclass
-      LEFT JOIN pg_attrdef attr_default ON attr_default.oid = default_dep.objid
-      LEFT JOIN pg_class default_table ON default_table.oid = attr_default.adrelid
-      LEFT JOIN pg_namespace default_ns ON default_ns.oid = default_table.relnamespace
-      WHERE c.relkind = 'S'
-        AND n.nspname <> 'information_schema'
-        AND n.nspname !~ '^pg_'
+    // 3. Recreate the complete custom-type dependency closure required by the
+    //    selected tables. Stop before sequences and tables if planning or DDL
+    //    fails so no table is left with a missing custom type.
+    let typePlan: CustomTypePlan;
+    try {
+      typePlan = await planCustomTypes(src, tgt, selectedTableNames);
+    } catch (err) {
+      report.typesFailed.push({
+        name: "custom type planning",
+        error: err instanceof Error ? err.message : String(err),
+        ddl: "-- custom type planning",
+        code:
+          err && typeof err === "object"
+            ? (err as PostgresErrorLike).code
+            : undefined,
+      });
+      return report;
+    }
+    report.typesSkipped.push(...typePlan.skipped);
+    report.typesFailed.push(...typePlan.failures);
+    if (report.typesFailed.length > 0) return report;
+
+    for (const definition of typePlan.definitions) {
+      const qualifiedName = `${definition.schema}.${definition.type}`;
+      try {
+        for (const schema of new Set(definition.requiredSchemas)) {
+          await tgt.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(schema)}`);
+        }
+        await tgt.query(definition.ddl);
+        report.typesCreated.push(qualifiedName);
+      } catch (err) {
+        report.typesFailed.push({
+          name: qualifiedName,
+          error: err instanceof Error ? err.message : String(err),
+          ddl: definition.ddl,
+          code:
+            err && typeof err === "object"
+              ? (err as PostgresErrorLike).code
+              : undefined,
+        });
+        return report;
+      }
+    }
+
+    // 4. Classify sequences before creating tables. Serial/default-backed
+    //    sequences must exist before a DEFAULT nextval(...) expression is
+    //    parsed. Identity sequences are deliberately not pre-created: the
+    //    identity clause creates and internally owns those sequences.
+    const sourceInheritance = await src.query<SourceTableInheritance>(`
+      SELECT
+        parent_ns.nspname AS parent_schema,
+        parent_class.relname AS parent_table,
+        parent_class.relkind AS parent_kind,
+        child_ns.nspname AS child_schema,
+        child_class.relname AS child_table,
+        child_class.relkind AS child_kind,
+        child_class.relispartition AS child_is_partition,
+        pg_get_expr(
+          child_class.relpartbound,
+          child_class.oid,
+          true
+        ) AS partition_bound
+      FROM pg_inherits inheritance
+      JOIN pg_class parent_class
+        ON parent_class.oid = inheritance.inhparent
+      JOIN pg_namespace parent_ns
+        ON parent_ns.oid = parent_class.relnamespace
+      JOIN pg_class child_class
+        ON child_class.oid = inheritance.inhrelid
+      JOIN pg_namespace child_ns
+        ON child_ns.oid = child_class.relnamespace
+      WHERE parent_ns.nspname <> 'information_schema'
+        AND parent_ns.nspname !~ '^pg_'
+        AND child_ns.nspname <> 'information_schema'
+        AND child_ns.nspname !~ '^pg_'
+        AND parent_class.relkind IN ('r', 'p')
+        AND child_class.relkind IN ('r', 'p')
         AND NOT EXISTS (
-          SELECT 1 FROM pg_depend d
-          WHERE d.objid = c.oid AND d.deptype = 'e'
+          SELECT 1
+          FROM pg_depend extension_dependency
+          WHERE extension_dependency.classid = 'pg_class'::regclass
+            AND extension_dependency.objid = child_class.oid
+            AND extension_dependency.deptype = 'e'
         )
-      ORDER BY c.relname
+      ORDER BY
+        parent_ns.nspname,
+        parent_class.relname,
+        inheritance.inhseqno
     `);
-    const sequencesToCopy = selectedTableNames
-      ? sequences.rows.filter(
-          (sequence) =>
-            sequence.owner_schema &&
-            sequence.owner_table &&
-            selectedTableNames.has(
-              `${sequence.owner_schema}.${sequence.owner_table}`,
+    const relationSelected = (schema: string, table: string) =>
+      selectedTableNames === null ||
+      selectedTableNames.has(`${schema}.${table}`);
+    const schemaTableNames = selectedTableNames
+      ? new Set(selectedTableNames)
+      : null;
+    if (schemaTableNames) {
+      let ancestorsAdded = true;
+      while (ancestorsAdded) {
+        ancestorsAdded = false;
+        for (const inheritance of sourceInheritance.rows) {
+          if (!inheritance.child_is_partition) continue;
+          const childName =
+            `${inheritance.child_schema}.${inheritance.child_table}`;
+          const parentName =
+            `${inheritance.parent_schema}.${inheritance.parent_table}`;
+          if (
+            schemaTableNames.has(childName) &&
+            !schemaTableNames.has(parentName)
+          ) {
+            schemaTableNames.add(parentName);
+            ancestorsAdded = true;
+          }
+        }
+      }
+    }
+    const relationIncludedInSchema = (schema: string, table: string) =>
+      schemaTableNames === null || schemaTableNames.has(`${schema}.${table}`);
+
+    const classicInheritance = sourceInheritance.rows.filter(
+      (inheritance) =>
+        !inheritance.child_is_partition &&
+        inheritance.parent_kind === "r" &&
+        inheritance.child_kind === "r",
+    );
+    if (selectedTableNames) {
+      const partialInheritance = classicInheritance.filter(
+        (inheritance) =>
+          relationSelected(inheritance.parent_schema, inheritance.parent_table) !==
+          relationSelected(inheritance.child_schema, inheritance.child_table),
+      );
+      if (partialInheritance.length > 0) {
+        for (const inheritance of partialInheritance) {
+          report.tablesFailed.push({
+            name:
+              `${inheritance.child_schema}.${inheritance.child_table} ` +
+              "(inheritance selection)",
+            error:
+              `Classic inheritance requires parent ${inheritance.parent_schema}.${inheritance.parent_table} ` +
+              `and child ${inheritance.child_schema}.${inheritance.child_table} to migrate together. ` +
+              "Select both tables so target queries preserve the source inheritance behavior.",
+            ddl:
+              `ALTER TABLE ${qualifiedIdentifier(inheritance.child_schema, inheritance.child_table)} ` +
+              `INHERIT ${qualifiedIdentifier(inheritance.parent_schema, inheritance.parent_table)}`,
+          });
+        }
+        return report;
+      }
+    }
+    const partitionsToRestore = sourceInheritance.rows.filter(
+      (inheritance) =>
+        inheritance.child_is_partition &&
+        relationIncludedInSchema(
+          inheritance.parent_schema,
+          inheritance.parent_table,
+        ) &&
+        relationIncludedInSchema(
+          inheritance.child_schema,
+          inheritance.child_table,
+        ),
+    );
+    const partitionsWithoutBounds = partitionsToRestore.filter(
+      (inheritance) => !inheritance.partition_bound,
+    );
+    if (partitionsWithoutBounds.length > 0) {
+      for (const partition of partitionsWithoutBounds) {
+        report.tablesFailed.push({
+          name: `${partition.child_schema}.${partition.child_table} (partition)`,
+          error:
+            `PostgreSQL returned no partition bound for ${partition.child_schema}.${partition.child_table}. ` +
+            "The hierarchy cannot be recreated safely.",
+          ddl:
+            `ALTER TABLE ${qualifiedIdentifier(partition.parent_schema, partition.parent_table)} ` +
+            `ATTACH PARTITION ${qualifiedIdentifier(partition.child_schema, partition.child_table)} (...)`,
+        });
+      }
+      return report;
+    }
+    const inheritanceToRestore = classicInheritance.filter(
+      (inheritance) =>
+        relationSelected(inheritance.parent_schema, inheritance.parent_table) &&
+        relationSelected(inheritance.child_schema, inheritance.child_table),
+    );
+
+    const additionalSchemas = new Set(
+      sourceInheritance.rows
+        .filter(
+          (inheritance) =>
+            relationIncludedInSchema(
+              inheritance.parent_schema,
+              inheritance.parent_table,
+            ) ||
+            relationIncludedInSchema(
+              inheritance.child_schema,
+              inheritance.child_table,
             ),
         )
+        .flatMap((inheritance) => [
+          inheritance.parent_schema,
+          inheritance.child_schema,
+        ]),
+    );
+    for (const schema of additionalSchemas) {
+      await tgt.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(schema)}`);
+    }
+
+    const unresolvedSequenceDefaults =
+      await src.query<UnresolvedSequenceDefault>(
+        `WITH column_defaults AS (
+           SELECT
+             attribute_default.oid AS default_oid,
+             table_ns.nspname AS schema,
+             table_class.relname AS table,
+             table_attribute.attname AS column,
+             attribute_default.adbin::text AS expression_tree,
+             pg_get_expr(
+               attribute_default.adbin,
+               attribute_default.adrelid,
+               true
+             ) AS expression
+           FROM pg_attrdef attribute_default
+           JOIN pg_class table_class
+             ON table_class.oid = attribute_default.adrelid
+           JOIN pg_namespace table_ns
+             ON table_ns.oid = table_class.relnamespace
+           JOIN pg_attribute table_attribute
+             ON table_attribute.attrelid = attribute_default.adrelid
+            AND table_attribute.attnum = attribute_default.adnum
+           WHERE table_class.relkind IN ('r', 'p')
+             AND table_ns.nspname <> 'information_schema'
+             AND table_ns.nspname !~ '^pg_'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM pg_depend extension_dependency
+               WHERE extension_dependency.classid = 'pg_class'::regclass
+                 AND extension_dependency.objid = table_class.oid
+                 AND extension_dependency.deptype = 'e'
+             )
+             AND (
+               $1::text[] IS NULL
+               OR (
+                 table_ns.nspname || '.' || table_class.relname
+               ) = ANY($1::text[])
+             )
+         ),
+         sequence_dependencies AS (
+           SELECT DISTINCT
+             default_dependency.objid AS default_oid
+           FROM pg_depend default_dependency
+           JOIN pg_class sequence_class
+             ON sequence_class.oid = default_dependency.refobjid
+            AND sequence_class.relkind = 'S'
+           WHERE default_dependency.classid = 'pg_attrdef'::regclass
+             AND default_dependency.refclassid = 'pg_class'::regclass
+             AND default_dependency.deptype = 'n'
+         )
+         SELECT
+           column_default.schema,
+           column_default.table,
+           column_default.column,
+           column_default.expression
+         FROM column_defaults column_default
+         CROSS JOIN LATERAL (
+           SELECT
+             ':funcid ' ||
+             'pg_catalog.nextval(regclass)'::regprocedure::oid::text ||
+             ' ' AS value
+         ) nextval_marker
+         LEFT JOIN sequence_dependencies
+           ON sequence_dependencies.default_oid = column_default.default_oid
+         WHERE position(
+           nextval_marker.value IN column_default.expression_tree
+         ) > 0
+           AND sequence_dependencies.default_oid IS NULL
+         ORDER BY
+           column_default.schema,
+           column_default.table,
+           column_default.column`,
+        [schemaTableNames ? [...schemaTableNames] : null],
+      );
+    if (unresolvedSequenceDefaults.rows.length > 0) {
+      for (const columnDefault of unresolvedSequenceDefaults.rows) {
+        report.tablesFailed.push({
+          name:
+            `${columnDefault.schema}.${columnDefault.table}.` +
+            `${columnDefault.column} (sequence default)`,
+          error:
+            "This default calls nextval() with a sequence name PostgreSQL " +
+            "cannot resolve as a catalog dependency. Use a schema-qualified " +
+            "regclass constant such as nextval('schema.sequence'::regclass) " +
+            "on the source before retrying.",
+          ddl: `DEFAULT ${columnDefault.expression}`,
+        });
+      }
+      return report;
+    }
+
+    const sequences = await src.query<SourceSequenceDefinition>(`
+      SELECT
+        sequence_ns.nspname AS schema,
+        sequence_class.relname AS name,
+        pg_catalog.format_type(sequence_catalog.seqtypid, NULL) AS data_type,
+        sequence_catalog.seqstart::text AS start_value,
+        sequence_catalog.seqincrement::text AS increment_by,
+        sequence_catalog.seqmin::text AS min_value,
+        sequence_catalog.seqmax::text AS max_value,
+        sequence_catalog.seqcache::text AS cache_size,
+        sequence_catalog.seqcycle AS cycles,
+        owner_ns.nspname AS owner_schema,
+        owner_table.relname AS owner_table,
+        owner_attribute.attname AS owner_column,
+        owner_dependency.deptype AS dependency_type,
+        COALESCE(
+          (
+            SELECT json_agg(
+              default_reference
+              ORDER BY default_reference.schema,
+                       default_reference.table,
+                       default_reference.column
+            )
+            FROM (
+              SELECT DISTINCT
+                default_ns.nspname AS schema,
+                default_table.relname AS table,
+                default_attribute.attname AS column
+              FROM pg_depend default_dependency
+              JOIN pg_attrdef attribute_default
+                ON attribute_default.oid = default_dependency.objid
+              JOIN pg_class default_table
+                ON default_table.oid = attribute_default.adrelid
+              JOIN pg_namespace default_ns
+                ON default_ns.oid = default_table.relnamespace
+              JOIN pg_attribute default_attribute
+                ON default_attribute.attrelid = attribute_default.adrelid
+               AND default_attribute.attnum = attribute_default.adnum
+              WHERE default_dependency.classid = 'pg_attrdef'::regclass
+                AND default_dependency.refclassid = 'pg_class'::regclass
+                AND default_dependency.refobjid = sequence_class.oid
+                AND default_dependency.deptype = 'n'
+            ) default_reference
+          ),
+          '[]'::json
+        ) AS default_references
+      FROM pg_class sequence_class
+      JOIN pg_namespace sequence_ns
+        ON sequence_ns.oid = sequence_class.relnamespace
+      JOIN pg_sequence sequence_catalog
+        ON sequence_catalog.seqrelid = sequence_class.oid
+      LEFT JOIN LATERAL (
+        SELECT dependency.refobjid, dependency.refobjsubid, dependency.deptype
+        FROM pg_depend dependency
+        WHERE dependency.classid = 'pg_class'::regclass
+          AND dependency.objid = sequence_class.oid
+          AND dependency.objsubid = 0
+          AND dependency.refclassid = 'pg_class'::regclass
+          AND dependency.deptype IN ('a', 'i')
+        ORDER BY CASE dependency.deptype WHEN 'i' THEN 0 ELSE 1 END
+        LIMIT 1
+      ) owner_dependency ON true
+      LEFT JOIN pg_class owner_table
+        ON owner_table.oid = owner_dependency.refobjid
+      LEFT JOIN pg_namespace owner_ns
+        ON owner_ns.oid = owner_table.relnamespace
+      LEFT JOIN pg_attribute owner_attribute
+        ON owner_attribute.attrelid = owner_dependency.refobjid
+       AND owner_attribute.attnum = owner_dependency.refobjsubid
+      WHERE sequence_class.relkind = 'S'
+        AND sequence_ns.nspname <> 'information_schema'
+        AND sequence_ns.nspname !~ '^pg_'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM pg_depend extension_dependency
+          WHERE extension_dependency.classid = 'pg_class'::regclass
+            AND extension_dependency.objid = sequence_class.oid
+            AND extension_dependency.deptype = 'e'
+        )
+      ORDER BY sequence_ns.nspname, sequence_class.relname
+    `);
+    const sequencesToCopy = schemaTableNames
+      ? sequences.rows.filter(
+          (sequence) => {
+            const relatedTables = [
+              ...(sequence.owner_schema && sequence.owner_table
+                ? [`${sequence.owner_schema}.${sequence.owner_table}`]
+                : []),
+              ...(sequence.default_references ?? []).map(
+                (reference) => `${reference.schema}.${reference.table}`,
+              ),
+            ];
+            return relatedTables.some((table) => schemaTableNames.has(table));
+          },
+        )
       : sequences.rows;
-    for (const s of sequencesToCopy) {
+    const identitySequencesByColumn = new Map(
+      sequencesToCopy
+        .filter(
+          (sequence) =>
+            sequence.dependency_type === "i" &&
+            sequence.owner_schema &&
+            sequence.owner_table &&
+            sequence.owner_column,
+        )
+        .map((sequence) => [
+          `${sequence.owner_schema}\0${sequence.owner_table}\0${sequence.owner_column}`,
+          sequence,
+        ]),
+    );
+    for (const sequence of sequencesToCopy) {
+      if (sequence.dependency_type === "i") continue;
+      const qualifiedName = qualifiedIdentifier(
+        sequence.schema,
+        sequence.name,
+      );
+      const ddl =
+        `CREATE SEQUENCE IF NOT EXISTS ${qualifiedName} ` +
+        `AS ${sequence.data_type} ${sequenceOptions(sequence)}`;
       try {
         await tgt.query(
-          `CREATE SEQUENCE IF NOT EXISTS "${s.schema}"."${s.seq}"`,
+          `CREATE SCHEMA IF NOT EXISTS ${quoteIdent(sequence.schema)}`,
         );
+        await tgt.query(ddl);
       } catch (err) {
         report.tablesFailed.push({
-          name: `${s.schema}.${s.seq} (sequence)`,
+          name: `${sequence.schema}.${sequence.name} (sequence)`,
           error: err instanceof Error ? err.message : String(err),
-          ddl: `CREATE SEQUENCE "${s.schema}"."${s.seq}"`,
+          ddl,
           code:
             err && typeof err === "object"
               ? (err as PostgresErrorLike).code
@@ -473,13 +1890,21 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 4. Tables (user tables only, exclude tables owned by extensions like
-    //    pg_stat_statements).
-    const tables = await src.query<{ schema: string; table: string }>(`
-      SELECT n.nspname AS schema, c.relname AS table
+    // 5. User and partitioned tables. Partition ancestors added to the schema
+    //    closure remain schema-only dependencies; publication selection is
+    //    still controlled by the original selectedTables list.
+    const tables = await src.query<SourceTableDefinition>(`
+      SELECT
+        n.nspname AS schema,
+        c.relname AS table,
+        c.relkind AS relation_kind,
+        CASE
+          WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid)
+          ELSE NULL
+        END AS partition_key
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'r'
+      WHERE c.relkind IN ('r', 'p')
         AND n.nspname <> 'information_schema'
         AND n.nspname !~ '^pg_'
         AND NOT EXISTS (
@@ -489,18 +1914,66 @@ async function copySchemaIfNeeded(
       ORDER BY c.relname
     `);
 
-    const tablesToCopy = selectedTableNames
+    const tablesToCopy = schemaTableNames
       ? tables.rows.filter((table) =>
-          selectedTableNames.has(tableName(table)),
+          schemaTableNames.has(tableName(table)),
         )
       : tables.rows;
+    const partitionChildNames = new Set(
+      partitionsToRestore.map(
+        (partition) =>
+          `${partition.child_schema}.${partition.child_table}`,
+      ),
+    );
 
     for (const t of tablesToCopy) {
-      const exists = await tgt.query<{ n: string }>(
-        "SELECT count(*)::text AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname = $1 AND c.relname = $2",
+      const exists = await tgt.query<{
+        relation_kind: string;
+        partition_key: string | null;
+      }>(
+        `SELECT
+           c.relkind AS relation_kind,
+           CASE
+             WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid)
+             ELSE NULL
+           END AS partition_key
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind IN ('r', 'p')
+           AND n.nspname = $1
+           AND c.relname = $2`,
         [t.schema, t.table],
       );
-      if (parseInt(exists.rows[0].n, 10) > 0) {
+      if (exists.rows.length > 0) {
+        if (exists.rows[0].relation_kind !== t.relation_kind) {
+          report.tablesFailed.push({
+            name: `${t.schema}.${t.table} (relation kind)`,
+            error:
+              `Source relation kind is ${t.relation_kind}, but the target already has ` +
+              `kind ${exists.rows[0].relation_kind}. PostgreSQL cannot convert an ordinary ` +
+              "table to a partitioned table in place.",
+            ddl:
+              t.relation_kind === "p"
+                ? `CREATE TABLE ${qualifiedIdentifier(t.schema, t.table)} (...) PARTITION BY ${t.partition_key ?? "(unknown)"}`
+                : `CREATE TABLE ${qualifiedIdentifier(t.schema, t.table)} (...)`,
+          });
+          continue;
+        }
+        if (
+          t.relation_kind === "p" &&
+          exists.rows[0].partition_key !== t.partition_key
+        ) {
+          report.tablesFailed.push({
+            name: `${t.schema}.${t.table} (partition key)`,
+            error:
+              `Source partition key is ${t.partition_key ?? "(unknown)"}, but the ` +
+              `target already uses ${exists.rows[0].partition_key ?? "(unknown)"}.`,
+            ddl:
+              `CREATE TABLE ${qualifiedIdentifier(t.schema, t.table)} (...) ` +
+              `PARTITION BY ${t.partition_key ?? "(unknown)"}`,
+          });
+          continue;
+        }
         report.tablesSkipped.push(`${t.schema}.${t.table}`);
         continue;
       }
@@ -510,12 +1983,16 @@ async function copySchemaIfNeeded(
         attname: string;
         formatted_type: string;
         attnotnull: boolean;
+        attgenerated: "" | "s" | "v";
+        attidentity: "" | "a" | "d";
         column_default: string | null;
       }>(
         `SELECT
            a.attname,
            pg_catalog.format_type(a.atttypid, a.atttypmod) AS formatted_type,
            a.attnotnull,
+           a.attgenerated,
+           a.attidentity,
            pg_get_expr(ad.adbin, ad.adrelid) AS column_default
          FROM pg_attribute a
          LEFT JOIN pg_attrdef ad
@@ -534,24 +2011,203 @@ async function copySchemaIfNeeded(
         [t.schema, t.table],
       );
 
-      const colDefs = cols.rows
-        .map((c) => {
-          const nn = c.attnotnull ? " NOT NULL" : "";
-          const def = c.column_default ? ` DEFAULT ${c.column_default}` : "";
-          return `"${c.attname}" ${c.formatted_type}${def}${nn}`;
-        })
-        .join(", ");
       const pk =
         pkCols.rows.length > 0
           ? `, PRIMARY KEY (${pkCols.rows.map((p) => `"${p.attname}"`).join(", ")})`
           : "";
-      const ddl = `CREATE TABLE "${t.schema}"."${t.table}" (${colDefs}${pk})`;
+      const generatedColumnNames = cols.rows
+        .filter((column) => column.attgenerated !== "")
+        .map((column) => `${t.schema}.${t.table}.${column.attname}`);
+      let ddl = "";
       try {
+        if (t.relation_kind === "p" && !t.partition_key) {
+          throw new Error(
+            `Partition key metadata not found for ${t.schema}.${t.table}.`,
+          );
+        }
+        const colDefs = cols.rows
+          .map((column) => {
+            const notNull = column.attnotnull ? " NOT NULL" : "";
+            let value = "";
+            if (column.attgenerated !== "") {
+              if (!column.column_default) {
+                throw new Error(
+                  `Generated column ${t.schema}.${t.table}.${column.attname} has no generation expression.`,
+                );
+              }
+              const persistence =
+                column.attgenerated === "v" ? "VIRTUAL" : "STORED";
+              value = ` GENERATED ALWAYS AS (${column.column_default}) ${persistence}`;
+            } else if (
+              column.attidentity !== "" &&
+              !partitionChildNames.has(`${t.schema}.${t.table}`)
+            ) {
+              const identitySequence = identitySequencesByColumn.get(
+                `${t.schema}\0${t.table}\0${column.attname}`,
+              );
+              if (!identitySequence) {
+                throw new Error(
+                  `Identity sequence metadata not found for ${t.schema}.${t.table}.${column.attname}.`,
+                );
+              }
+              const generation =
+                column.attidentity === "a" ? "ALWAYS" : "BY DEFAULT";
+              value =
+                ` GENERATED ${generation} AS IDENTITY (` +
+                `SEQUENCE NAME ${qualifiedIdentifier(identitySequence.schema, identitySequence.name)} ` +
+                `${sequenceOptions(identitySequence)})`;
+            } else if (column.column_default) {
+              value = ` DEFAULT ${column.column_default}`;
+            }
+            return `${quoteIdent(column.attname)} ${column.formatted_type}${value}${notNull}`;
+          })
+          .join(", ");
+        ddl =
+          `CREATE TABLE ${qualifiedIdentifier(t.schema, t.table)} (${colDefs}${pk})` +
+          (t.relation_kind === "p"
+            ? ` PARTITION BY ${t.partition_key}`
+            : "");
+        await tgt.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(t.schema)}`);
         await tgt.query(ddl);
         report.tablesCreated.push(`${t.schema}.${t.table}`);
       } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        const generatedContext =
+          generatedColumnNames.length > 0
+            ? `Generated columns: ${generatedColumnNames.join(", ")}. `
+            : "";
         report.tablesFailed.push({
           name: `${t.schema}.${t.table}`,
+          error: `${generatedContext}${error}`,
+          ddl:
+            ddl ||
+            `CREATE TABLE ${quoteIdent(t.schema)}.${quoteIdent(t.table)} (...)`,
+          code:
+            err && typeof err === "object"
+              ? (err as PostgresErrorLike).code
+              : undefined,
+        });
+      }
+    }
+
+    const tablesAvailableOnTarget = new Set([
+      ...report.tablesCreated,
+      ...report.tablesSkipped,
+    ]);
+
+    // Restore declarative partition trees from roots outward. Explicit
+    // partitions are attached before DEFAULT siblings so existing rows can be
+    // validated against their narrowest source bounds first.
+    const orderedPartitions: SourceTableInheritance[] = [];
+    const remainingPartitions = [...partitionsToRestore];
+    while (remainingPartitions.length > 0) {
+      const remainingChildren = new Set(
+        remainingPartitions.map(
+          (partition) =>
+            `${partition.child_schema}.${partition.child_table}`,
+        ),
+      );
+      const ready = remainingPartitions
+        .filter(
+          (partition) =>
+            !remainingChildren.has(
+              `${partition.parent_schema}.${partition.parent_table}`,
+            ),
+        )
+        .sort((a, b) => {
+          const aDefault = a.partition_bound === "DEFAULT" ? 1 : 0;
+          const bDefault = b.partition_bound === "DEFAULT" ? 1 : 0;
+          if (aDefault !== bDefault) return aDefault - bDefault;
+          return `${a.parent_schema}.${a.parent_table}.${a.child_schema}.${a.child_table}`.localeCompare(
+            `${b.parent_schema}.${b.parent_table}.${b.child_schema}.${b.child_table}`,
+          );
+        });
+      if (ready.length === 0) {
+        for (const partition of remainingPartitions) {
+          report.tablesFailed.push({
+            name:
+              `${partition.child_schema}.${partition.child_table} ` +
+              "(partition dependency)",
+            error: "Partition dependency cycle detected in pg_inherits.",
+            ddl:
+              `ALTER TABLE ${qualifiedIdentifier(partition.parent_schema, partition.parent_table)} ` +
+              `ATTACH PARTITION ${qualifiedIdentifier(partition.child_schema, partition.child_table)} ${partition.partition_bound ?? "(unknown)"}`,
+          });
+        }
+        return report;
+      }
+      orderedPartitions.push(...ready);
+      for (const partition of ready) {
+        const index = remainingPartitions.indexOf(partition);
+        if (index >= 0) remainingPartitions.splice(index, 1);
+      }
+    }
+
+    for (const partition of orderedPartitions) {
+      const parentName = `${partition.parent_schema}.${partition.parent_table}`;
+      const childName = `${partition.child_schema}.${partition.child_table}`;
+      if (
+        !tablesAvailableOnTarget.has(parentName) ||
+        !tablesAvailableOnTarget.has(childName)
+      ) {
+        continue;
+      }
+      const ddl =
+        `ALTER TABLE ${qualifiedIdentifier(partition.parent_schema, partition.parent_table)} ` +
+        `ATTACH PARTITION ${qualifiedIdentifier(partition.child_schema, partition.child_table)} ` +
+        partition.partition_bound;
+      const existingPartition = await tgt.query<{
+        child_is_partition: boolean;
+        partition_bound: string | null;
+      }>(
+        `SELECT
+           child_class.relispartition AS child_is_partition,
+           pg_get_expr(
+             child_class.relpartbound,
+             child_class.oid,
+             true
+           ) AS partition_bound
+         FROM pg_inherits inheritance
+         JOIN pg_class parent_class
+           ON parent_class.oid = inheritance.inhparent
+         JOIN pg_namespace parent_ns
+           ON parent_ns.oid = parent_class.relnamespace
+         JOIN pg_class child_class
+           ON child_class.oid = inheritance.inhrelid
+         JOIN pg_namespace child_ns
+           ON child_ns.oid = child_class.relnamespace
+         WHERE parent_ns.nspname = $1
+           AND parent_class.relname = $2
+           AND child_ns.nspname = $3
+           AND child_class.relname = $4`,
+        [
+          partition.parent_schema,
+          partition.parent_table,
+          partition.child_schema,
+          partition.child_table,
+        ],
+      );
+      if (existingPartition.rows.length > 0) {
+        const targetPartition = existingPartition.rows[0];
+        if (
+          !targetPartition.child_is_partition ||
+          targetPartition.partition_bound !== partition.partition_bound
+        ) {
+          report.tablesFailed.push({
+            name: `${childName} (partition bound)`,
+            error:
+              `Source partition bound is ${partition.partition_bound}, but the ` +
+              `target already uses ${targetPartition.partition_bound ?? "a non-partition inheritance edge"}.`,
+            ddl,
+          });
+        }
+        continue;
+      }
+      try {
+        await tgt.query(ddl);
+      } catch (err) {
+        report.tablesFailed.push({
+          name: `${childName} (partition attach)`,
           error: err instanceof Error ? err.message : String(err),
           ddl,
           code:
@@ -562,18 +2218,119 @@ async function copySchemaIfNeeded(
       }
     }
 
-    // 5. Indexes (non-PK, since PKs were inlined above).
-    //    Use pg_get_indexdef() which produces fully qualified, valid DDL.
+    // CREATE TABLE above intentionally remains dependency-free. Once every
+    // selected table exists, restore classic PostgreSQL inheritance so parent
+    // queries include child rows exactly as they do on the source.
+    for (const inheritance of inheritanceToRestore) {
+      const parentName =
+        `${inheritance.parent_schema}.${inheritance.parent_table}`;
+      const childName = `${inheritance.child_schema}.${inheritance.child_table}`;
+      if (
+        !tablesAvailableOnTarget.has(parentName) ||
+        !tablesAvailableOnTarget.has(childName)
+      ) {
+        continue;
+      }
+      const existingInheritance = await tgt.query(
+        `SELECT 1
+         FROM pg_inherits inheritance
+         JOIN pg_class parent_class
+           ON parent_class.oid = inheritance.inhparent
+         JOIN pg_namespace parent_ns
+           ON parent_ns.oid = parent_class.relnamespace
+         JOIN pg_class child_class
+           ON child_class.oid = inheritance.inhrelid
+         JOIN pg_namespace child_ns
+           ON child_ns.oid = child_class.relnamespace
+         WHERE parent_ns.nspname = $1
+           AND parent_class.relname = $2
+           AND child_ns.nspname = $3
+           AND child_class.relname = $4`,
+        [
+          inheritance.parent_schema,
+          inheritance.parent_table,
+          inheritance.child_schema,
+          inheritance.child_table,
+        ],
+      );
+      if (existingInheritance.rows.length > 0) continue;
+      const ddl =
+        `ALTER TABLE ${qualifiedIdentifier(inheritance.child_schema, inheritance.child_table)} ` +
+        `INHERIT ${qualifiedIdentifier(inheritance.parent_schema, inheritance.parent_table)}`;
+      try {
+        await tgt.query(ddl);
+      } catch (err) {
+        report.tablesFailed.push({
+          name: `${childName} (inheritance)`,
+          error: err instanceof Error ? err.message : String(err),
+          ddl,
+          code:
+            err && typeof err === "object"
+              ? (err as PostgresErrorLike).code
+              : undefined,
+        });
+      }
+    }
+
+    // Serial sequences are created without ownership because their tables do
+    // not exist yet. Restore OWNED BY after table creation so
+    // pg_get_serial_sequence(), DROP TABLE, and cutover discovery behave like
+    // the source. A sequence copied through a selected table's default can be
+    // owned by an excluded table; leave it unowned instead of referencing a
+    // relation that was intentionally not copied.
+    for (const sequence of sequencesToCopy) {
+      if (
+        sequence.dependency_type !== "a" ||
+        !sequence.owner_schema ||
+        !sequence.owner_table ||
+        !sequence.owner_column
+      ) {
+        continue;
+      }
+      if (
+        !tablesAvailableOnTarget.has(
+          `${sequence.owner_schema}.${sequence.owner_table}`,
+        )
+      ) {
+        continue;
+      }
+      const ddl =
+        `ALTER SEQUENCE ${qualifiedIdentifier(sequence.schema, sequence.name)} ` +
+        `OWNED BY ${qualifiedIdentifier(sequence.owner_schema, sequence.owner_table)}.${quoteIdent(sequence.owner_column)}`;
+      try {
+        await tgt.query(ddl);
+      } catch (err) {
+        report.tablesFailed.push({
+          name: `${sequence.schema}.${sequence.name} (sequence ownership)`,
+          error: err instanceof Error ? err.message : String(err),
+          ddl,
+          code:
+            err && typeof err === "object"
+              ? (err as PostgresErrorLike).code
+              : undefined,
+        });
+      }
+    }
+
+    // 6. Indexes (non-PK, since PKs were inlined above). Partition index
+    //    children are skipped: creating the root index recursively lets
+    //    PostgreSQL create or adopt the complete, valid index hierarchy.
     const indexes = await src.query<{
       schema: string;
       table: string;
       indexname: string;
       indexdef: string;
+      is_partition_child: boolean;
     }>(`
       SELECT n.nspname AS schema,
              c.relname AS table,
              i.indexrelid::regclass::text AS indexname,
-             pg_get_indexdef(i.indexrelid) AS indexdef
+             pg_get_indexdef(i.indexrelid) AS indexdef,
+             EXISTS (
+               SELECT 1
+               FROM pg_inherits index_inheritance
+               WHERE index_inheritance.inhrelid = i.indexrelid
+             ) AS is_partition_child
       FROM pg_index i
       JOIN pg_class c ON c.oid = i.indrelid
       JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -586,14 +2343,18 @@ async function copySchemaIfNeeded(
           WHERE d.objid = i.indexrelid AND d.deptype = 'e'
         )
     `);
-    const indexesToCopy = selectedTableNames
+    const indexesToCopy = schemaTableNames
       ? indexes.rows.filter((index) =>
-          selectedTableNames.has(tableName(index)),
+          schemaTableNames.has(tableName(index)),
         )
       : indexes.rows;
     for (const ix of indexesToCopy) {
+      if (ix.is_partition_child) continue;
+      const ddl = ix.indexdef
+        .replace(/^CREATE INDEX/, "CREATE INDEX IF NOT EXISTS")
+        .replace(" ON ONLY ", " ON ");
       try {
-        await tgt.query(ix.indexdef.replace(/^CREATE INDEX/, "CREATE INDEX IF NOT EXISTS"));
+        await tgt.query(ddl);
         report.indexesCreated++;
       } catch (err) {
         report.indexesFailed.push({
@@ -672,16 +2433,19 @@ export async function setupReplication(
       code: firstFailure.code,
     });
   }
+  if (schemaReport.typesFailed.length > 0) {
+    const firstFailure = schemaReport.typesFailed[0];
+    throw setupFailure("schema-copy", firstFailure.name, {
+      message: `Custom type copy failed for ${firstFailure.name}. ${firstFailure.error}`,
+      code: firstFailure.code,
+    });
+  }
   if (schemaReport.tablesFailed.length > 0) {
     const firstFailure = schemaReport.tablesFailed[0];
-    throw setupFailure(
-      "schema-copy",
-      firstFailure.name,
-      {
-        message: `Schema copy failed for ${schemaReport.tablesFailed.length} table(s). ${firstFailure.error}`,
-        code: firstFailure.code,
-      },
-    );
+    throw setupFailure("schema-copy", firstFailure.name, {
+      message: `Schema copy failed for ${schemaReport.tablesFailed.length} table(s). ${firstFailure.error}`,
+      code: firstFailure.code,
+    });
   }
 
   let tables: string[] = [];

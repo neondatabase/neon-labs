@@ -111,11 +111,11 @@ export interface NeonExtension {
   comments?: string;
 }
 
-/** Map an UpgradePath to the migration-tool route in the app. */
+/** Map an UpgradePath to its migration destination. */
 export const UPGRADE_PATH_ROUTES: Record<UpgradePath, string> = {
   "logical-replication": "/migrate/replication",
   "dump-restore": "/migrate/dump-restore",
-  "import-assistant": "/migrate/import-assistant",
+  "import-assistant": "https://console.neon.tech/app/projects",
 };
 
 /* ──────────────────────────────────────────────────────────────
@@ -130,6 +130,18 @@ export interface ReplicationPreflight {
     tableCount: number;
     tables: string[];
     tablesWithoutPK: string[];
+    /** No-PK tables that still cannot identify rows for UPDATE/DELETE. */
+    tablesWithoutReplicaIdentity?: string[];
+    /** No-PK tables covered by REPLICA IDENTITY FULL. */
+    tablesWithReplicaIdentityFull?: string[];
+    /** Generated columns recreated on the target instead of transmitted. */
+    generatedColumns?: {
+      table: string;
+      column: string;
+      kind: "stored" | "virtual";
+    }[];
+    /** Source tables excluded because unlogged relations have no WAL. */
+    unloggedTables?: string[];
     roleHasReplication: boolean;
     rolname: string;
   };
@@ -408,23 +420,6 @@ export interface DumpRestoreResult {
   rowCounts: RowCountCheck[];
   totalRowsCopied: number;
   totalBytesEstimate: number;
-}
-
-/* ──────────────────────────────────────────────────────────────
-   Import Assistant — handoff to Neon Console
-   ────────────────────────────────────────────────────────────── */
-
-export interface ImportAssistantStatus {
-  /** Project ID being imported into */
-  projectId: string;
-  /** What's actually in the target right now */
-  tableCount: number;
-  rowCountsByTable: { table: string; rows: number }[];
-  totalRows: number;
-  importStarted: boolean;
-  importComplete: boolean;
-  /** Deep-link to Neon Console's import page for this project */
-  consoleUrl: string;
 }
 
 /* ──────────────────────────────────────────────────────────────
