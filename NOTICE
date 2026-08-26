@@ -1,0 +1,85 @@
+Copyright (2026) Databricks, Inc. This Software includes software developed at Databricks (https://www.databricks.com/) and its use is subject to the included LICENSE file.
+
+Dependencies are grouped below by license. The full text of each license is available via the link in the section header.
+
+MIT License
+
+This Software contains code from the following open source projects, licensed under the MIT License (https://opensource.org/licenses/MIT).
+
+Package: @base-ui/react
+Version: 1.7.0
+Project URL: https://github.com/mui/base-ui
+Copyright: Copyright (c) 2019 Material-UI SAS
+
+Package: @hugeicons/core-free-icons
+Version: 4.2.3
+Project URL: https://github.com/hugeicons/hugeicons
+Copyright: Copyright (c) 2025 Hugeicons
+
+Package: @hugeicons/react
+Version: 1.1.9
+Project URL: https://github.com/hugeicons/hugeicons
+Copyright: Copyright (c) 2025 Hugeicons
+
+Package: @tanstack/react-table
+Version: 8.21.3
+Project URL: https://github.com/TanStack/table
+Copyright: Copyright (c) 2016 Tanner Linsley
+
+Package: @types/pg
+Version: 8.20.3
+Project URL: https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/pg
+Copyright: DefinitelyTyped Authors
+
+Package: clsx
+Version: 2.1.1
+Project URL: https://github.com/lukeed/clsx
+Copyright: Copyright (c) Luke Edwards luke.edwards05@gmail.com (lukeed.com)
+
+Package: iron-session
+Version: 8.0.4
+Project URL: https://github.com/vvo/iron-session
+Copyright: Copyright (c) 2021 Vincent Voyer
+
+Package: next
+Version: 16.2.11
+Project URL: https://github.com/vercel/next.js
+Copyright: Copyright (c) 2025 Vercel, Inc.
+
+Package: pg
+Version: 8.22.0
+Project URL: https://github.com/brianc/node-postgres
+Copyright: Copyright (c) 2010-2020 Brian Carlson (brian.m.carlson@gmail.com)
+
+Package: react
+Version: 19.2.4
+Project URL: https://github.com/facebook/react
+Copyright: Copyright (c) Meta Platforms, Inc. and affiliates
+
+Package: react-dom
+Version: 19.2.4
+Project URL: https://github.com/facebook/react
+Copyright: Copyright (c) Meta Platforms, Inc. and affiliates
+
+Package: tailwind-merge
+Version: 3.6.0
+Project URL: https://github.com/dcastil/tailwind-merge
+Copyright: Copyright (c) 2021 Dany Castillo
+
+Apache License 2.0
+
+This Software contains code from the following open source projects, licensed under the Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+
+Package: class-variance-authority
+Version: 0.7.1
+Project URL: https://github.com/joe-bell/cva
+Copyright: Copyright 2022 Joe Bell
+
+ISC License
+
+This Software contains code from the following open source projects, licensed under the ISC License (https://opensource.org/licenses/ISC).
+
+Package: lucide-react
+Version: 1.28.0
+Project URL: https://github.com/lucide-icons/lucide
+Copyright: Copyright (c) 2026 Lucide Icons and Contributors
