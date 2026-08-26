@@ -38,7 +38,7 @@ git clone https://github.com/neondatabase/neon-labs.git
 cd neon-labs
 npm install
 cp .env.example .env.local
-# add OAuth credentials, or NEON_API_KEY for local development only
+# add NEON_API_KEY for local development
 npm run dev
 ```
 
@@ -47,12 +47,6 @@ Open [http://localhost:3000](http://localhost:3000).
 ## Configuring `.env.local`
 
 ```env
-# OAuth. Register http://localhost:3000/api/auth/callback/neon.
-APP_URL=http://localhost:3000
-NEON_OAUTH_CLIENT_ID=...
-NEON_OAUTH_CLIENT_SECRET=...
-SESSION_SECRET=at-least-32-random-characters
-
 # Local-development fallback only. Ignored in production.
 NEON_API_KEY=napi_...
 NEON_SOURCE_PROJECT_ID=your-source-project-id
@@ -60,10 +54,6 @@ NEON_SOURCE_CONNECTION_STRING=postgresql://neondb_owner:PASSWORD@ep-XXXX.region.
 NEON_ORG_ID=org-...
 NEON_ORG_NAME=My Org
 ```
-
-Generate `SESSION_SECRET` with `openssl rand -base64 32`. In production,
-set `APP_URL` to the stable custom domain, for example
-`https://labs.neon.com`.
 
 ## Features
 
@@ -97,16 +87,6 @@ path already runs.
 
 Above 1 TB the results tell you to talk to Neon rather than plan a
 migration yourself.
-
-## Multi-user / sharing this with your team
-
-The hosted app uses a separate Neon OAuth session for every visitor.
-A shared server-side API key is deliberately unsupported in production:
-it would make every visitor act as the owner of that key.
-
-The OAuth client requests project read/create/update and organization
-read scopes. Assessment is read-only; migration tools need write scopes
-to create targets and enable logical replication after confirmation.
 
 ## Security notes
 
