@@ -1,5 +1,6 @@
 import { Check, Copy } from "lucide-react";
 import type { CheckStatus } from "@/lib/types";
+import { cn } from "@/lib/utils";
 import { Badge } from "./ui/badge";
 
 /* ──────────────────────────────────────────────────────────────
@@ -47,7 +48,10 @@ export function StatusBadge({ status }: { status: CheckStatus | string }) {
     not_supported: "Not supported",
   };
   return (
-    <Badge variant="outline" className={`rounded-[4px] text-label ${styles[status] ?? styles.warning}`}>
+    <Badge
+      variant="outline"
+      className={`text-label rounded-[4px] ${styles[status] ?? styles.warning}`}
+    >
       {labels[status] ?? status}
     </Badge>
   );
@@ -63,7 +67,14 @@ export function ScoreRing({ score }: { score: number }) {
   return (
     <div className="relative inline-flex h-28 w-28 items-center justify-center">
       <svg className="h-28 w-28 -rotate-90" viewBox="0 0 100 100">
-        <circle cx="50" cy="50" r="40" fill="none" stroke="#262727" strokeWidth="6" />
+        <circle
+          cx="50"
+          cy="50"
+          r="40"
+          fill="none"
+          stroke="#262727"
+          strokeWidth="6"
+        />
         <circle
           cx="50"
           cy="50"
@@ -77,10 +88,10 @@ export function ScoreRing({ score }: { score: number }) {
         />
       </svg>
       <div className="absolute text-center">
-        <span className="text-display-sm font-medium leading-none tracking-[-0.5px] text-foreground tnum">
+        <span className="text-display-sm text-foreground tnum leading-none font-medium tracking-[-0.5px]">
           {score}
         </span>
-        <p className="mt-1 text-micro uppercase tracking-[0.08em] text-[#9ca3af]">
+        <p className="text-micro mt-1 tracking-[0.08em] text-[#9ca3af] uppercase">
           / 100
         </p>
       </div>
@@ -94,20 +105,29 @@ export function PageHeader({
   title,
   subtitle,
   actions,
+  className,
 }: {
   title: string;
   subtitle?: string;
   actions?: React.ReactNode;
+  className?: string;
 }) {
   return (
-    <div className="mb-8 flex flex-wrap items-end justify-between gap-4">
-      <div>
+    <div
+      className={cn(
+        "mb-8 flex flex-wrap items-end justify-between gap-x-6 gap-y-4",
+        className,
+      )}
+    >
+      <div className="min-w-0">
         <h1 className={`${neon.h1} text-balance`}>{title}</h1>
-        {subtitle && (
-          <p className={`mt-1 text-ui text-pretty ${neon.muted}`}>{subtitle}</p>
-        )}
+        {subtitle ? (
+          <p className="text-ui text-muted-foreground mt-1.5 max-w-[54ch] text-pretty">
+            {subtitle}
+          </p>
+        ) : null}
       </div>
-      {actions && <div className="flex gap-2">{actions}</div>}
+      {actions ? <div className="flex shrink-0 gap-2">{actions}</div> : null}
     </div>
   );
 }
@@ -169,13 +189,17 @@ export function CopyToggleIcon({
       <Copy
         aria-hidden
         className={`${base} h-full w-full ${
-          copied ? "scale-[0.25] opacity-0 blur-[4px]" : "scale-100 opacity-100 blur-0"
+          copied
+            ? "scale-[0.25] opacity-0 blur-[4px]"
+            : "blur-0 scale-100 opacity-100"
         }`}
       />
       <Check
         aria-hidden
         className={`${base} h-full w-full ${
-          copied ? "scale-100 opacity-100 blur-0" : "scale-[0.25] opacity-0 blur-[4px]"
+          copied
+            ? "blur-0 scale-100 opacity-100"
+            : "scale-[0.25] opacity-0 blur-[4px]"
         }`}
       />
     </span>
@@ -184,16 +208,20 @@ export function CopyToggleIcon({
 
 /* ── Breadcrumb, console-style with slash separators ─────── */
 
-export function Breadcrumb({ items }: { items: { label: string; href?: string }[] }) {
+export function Breadcrumb({
+  items,
+}: {
+  items: { label: string; href?: string }[];
+}) {
   return (
-    <nav className="flex items-center gap-2 text-ui">
+    <nav className="text-ui flex items-center gap-2">
       {items.map((item, i) => (
         <span key={i} className="flex items-center gap-2">
           {i > 0 && <span className="text-[#262727]">/</span>}
           {item.href ? (
             <a
               href={item.href}
-              className={`text-[#9ca3af] transition-colors duration-150 ease-out hover:text-foreground ${neon.focusRing} rounded-[2px]`}
+              className={`hover:text-foreground text-[#9ca3af] transition-colors duration-150 ease-out ${neon.focusRing} rounded-[2px]`}
             >
               {item.label}
             </a>

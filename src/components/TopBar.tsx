@@ -10,6 +10,8 @@ import {
   setTargetOverride,
 } from "@/lib/neon-settings";
 import { setSetupSkipped } from "@/lib/setup-status";
+import { neon } from "@/components/ui";
+import { cn } from "@/lib/utils";
 import { SidebarTrigger } from "./ui/sidebar";
 
 const TITLES: Record<string, string> = {
@@ -37,8 +39,15 @@ const SECTIONS: { match: (p: string) => boolean; label: string; href: string }[]
     },
   ];
 
+const crumbIdle = cn(
+  "rounded-sm text-muted-foreground transition-colors duration-150 ease-out hover:text-foreground",
+  neon.focusRing,
+);
+const crumbLink = cn("truncate", crumbIdle);
+
 export function TopBar() {
   const pathname = usePathname();
+  const atHome = pathname === "/";
   const section = SECTIONS.find((s) => s.match(pathname)) ?? null;
   /* At a section root the section crumb already names the page. */
   const title = pathname === section?.href ? null : (TITLES[pathname] ?? null);
@@ -101,53 +110,84 @@ export function TopBar() {
   }
 
   return (
-    <header className="sticky top-0 z-10 flex h-[52px] items-center justify-between border-b border-[#262727] bg-[#0c0d0d]/80 px-6 backdrop-blur">
+    <header className="sticky top-0 z-10 flex h-[52px] items-center justify-between border-b border-border bg-background/80 px-8 backdrop-blur">
       <div className="flex min-w-0 items-center gap-2">
         <SidebarTrigger className="-ml-2 md:hidden" />
-        <nav className="flex min-w-0 items-center gap-2 text-ui">
-          <Link
-            aria-label="Back to Neon Labs"
-            className="rounded-[2px] p-1 text-[#9ca3af] transition-colors duration-150 ease-out hover:bg-[#1a1b1b] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c0d0d]"
-            href="/"
-          >
-            <Home className="h-3.5 w-3.5" />
-          </Link>
-          {section && (
-            <>
-              <span className="text-[#262727]">/</span>
-              <Link
-                href={section.href}
-                className="truncate rounded-[2px] text-[#9ca3af] transition-colors duration-150 ease-out hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c0d0d]"
-              >
-                {section.label}
-              </Link>
-            </>
+        <nav
+          aria-label="Breadcrumb"
+          className="flex min-w-0 items-center gap-2 text-ui"
+        >
+          {atHome ? (
+            <span aria-hidden="true" className="rounded-sm p-1 text-foreground">
+              <Home className="size-3.5" />
+            </span>
+          ) : (
+            <Link
+              aria-label="Home"
+              className={cn("p-1 hover:bg-muted", crumbIdle)}
+              href="/"
+            >
+              <Home className="size-3.5" />
+            </Link>
           )}
-        {title && (
-          <>
-              {section ? <span className="text-[#262727]">/</span> : null}
-              <span className="truncate text-foreground">{title}</span>
-          </>
-        )}
+          {atHome ? (
+            <>
+              <span aria-hidden="true" className="text-border">
+                /
+              </span>
+              <span aria-current="page" className="truncate text-foreground">
+                Home
+              </span>
+            </>
+          ) : null}
+          {section ? (
+            <>
+              <span aria-hidden="true" className="text-border">
+                /
+              </span>
+              {title ? (
+                <Link href={section.href} className={crumbLink}>
+                  {section.label}
+                </Link>
+              ) : (
+                <span aria-current="page" className="truncate text-foreground">
+                  {section.label}
+                </span>
+              )}
+            </>
+          ) : null}
+          {title ? (
+            <>
+              <span aria-hidden="true" className="text-border">
+                /
+              </span>
+              <span aria-current="page" className="truncate text-foreground">
+                {title}
+              </span>
+            </>
+          ) : null}
         </nav>
       </div>
 
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1.5">
         {authenticated && !developmentFallback && (
           <button
             type="button"
             onClick={signOut}
             disabled={signingOut}
-            className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-caption text-[#9ca3af] transition-colors duration-150 ease-out hover:bg-[#1a1b1b] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#00e599]/50 disabled:cursor-wait disabled:opacity-60"
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-caption text-muted-foreground transition-colors duration-150 ease-out hover:bg-muted hover:text-foreground disabled:cursor-wait disabled:opacity-60",
+              neon.focusRing,
+            )}
           >
-            <LogOut className="h-3.5 w-3.5" />
+            <LogOut className="size-3.5" />
             {signingOut ? "Signing out…" : "Sign out"}
           </button>
         )}
         {(authenticated || developmentFallback) && (
           <div
             title={user?.name ?? orgName ?? "Connected to Neon"}
-            className="relative ml-1 flex h-7 w-7 items-center justify-center overflow-hidden rounded-full bg-[#00e599]/15 text-label font-medium text-[#00e599]"
+            className="relative flex size-7 items-center justify-center overflow-hidden rounded-full bg-primary/15 text-label font-medium text-primary"
           >
             {initials(user?.name ?? orgName ?? "Neon")}
             {user?.image ? (
@@ -155,7 +195,7 @@ export function TopBar() {
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 alt={`${user.name} avatar`}
-                className="absolute inset-0 h-full w-full object-cover"
+                className="absolute inset-0 size-full object-cover"
                 onError={(event) => {
                   event.currentTarget.style.display = "none";
                 }}
