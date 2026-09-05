@@ -1,102 +1,123 @@
 "use client";
 
 import Link from "next/link";
-import { ArrowRight, Check, ExternalLink } from "lucide-react";
+import {
+  ArrowRight01Icon,
+  ArrowRight02Icon,
+  ArrowUpRight01Icon,
+  DatabaseImportIcon,
+  DatabaseRestoreIcon,
+  DatabaseSyncIcon,
+  DiamondMinusIcon,
+  DiamondPlusIcon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon, type IconSvgElement } from '@hugeicons/react'
 
-import { useAssessment } from "@/components/AssessmentProvider";
-import { PageHeader, neon } from "@/components/ui";
-import { Button } from "@/components/ui/button";
-import { UPGRADE_PATH_ROUTES, type UpgradePath } from "@/lib/types";
+import { useAssessment } from '@/components/AssessmentProvider'
+import { PageHeader, neon } from '@/components/ui'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import {
+  Tabs,
+  TabsContent,
+  TabsIndicator,
+  TabsList,
+  TabsTrigger,
+} from '@/components/ui/tabs'
+import { UPGRADE_PATH_ROUTES, type UpgradePath } from '@/lib/types'
 
 const PATHS: Record<
   UpgradePath,
   {
-    label: string;
-    sizeRange: string;
-    downtime: string;
-    when: string;
-    consoleInstruction?: string;
-    pros: string[];
-    cons: string[];
-    docsUrl: string;
+    label: string
+    icon: IconSvgElement
+    sizeRange: string
+    downtime: string
+    when: string
+    consoleInstruction?: string
+    pros: string[]
+    cons: string[]
+    docsUrl: string
   }
 > = {
-  "import-assistant": {
-    label: "Import Data Assistant",
-    sizeRange: "< 10 GB",
-    downtime: "Minutes",
-    when:
-      "Small databases where you can tolerate a brief read/write pause during the import.",
+  'import-assistant': {
+    label: 'Import Data Assistant',
+    icon: DatabaseImportIcon,
+    sizeRange: '< 10 GB',
+    downtime: 'Minutes',
+    when: 'Small databases where you can tolerate a brief read/write pause during the import.',
     consoleInstruction:
-      "In Neon Console, click the data import button on the Projects page to continue.",
+      'In Neon Console, click the data import button on the Projects page to continue.',
     pros: [
-      "Runs entirely on Neon infrastructure",
-      "No CLI / tooling required",
-      "Single click after source configured",
+      'Runs entirely on Neon infrastructure',
+      'No CLI / tooling required',
+      'Single click after source configured',
     ],
     cons: [
-      "Size cap (~10 GB)",
-      "Creates an import branch (not root)",
-      "Brief write downtime during cutover",
+      'Size cap (~10 GB)',
+      'Creates an import branch (not root)',
+      'Brief write downtime during cutover',
     ],
-    docsUrl: "https://neon.com/docs/import/import-data-assistant",
+    docsUrl: 'https://neon.com/docs/import/import-data-assistant',
   },
-  "dump-restore": {
-    label: "pg_dump + pg_restore",
-    sizeRange: "10 GB – 200 GB",
-    downtime: "Minutes to hours",
-    when:
-      "Medium databases where you have a planned maintenance window. Simple, well-understood, no replication slots to manage.",
+  'dump-restore': {
+    label: 'pg_dump + pg_restore',
+    icon: DatabaseRestoreIcon,
+    sizeRange: '10 GB – 200 GB',
+    downtime: 'Minutes to hours',
+    when: 'Medium databases where you have a planned maintenance window. Simple, well-understood, no replication slots to manage.',
     pros: [
-      "Simple & well understood",
-      "Full pg_dump fidelity with parallel restore",
-      "No long-running replication slot",
+      'Simple & well understood',
+      'Full pg_dump fidelity with parallel restore',
+      'No long-running replication slot',
     ],
     cons: [
-      "Downtime scales with database size",
-      "pg_dumpall not supported on Neon, dump per-database",
-      "Avoid pooled connections, use unpooled",
+      'Downtime scales with database size',
+      'pg_dumpall not supported on Neon, dump per-database',
+      'Avoid pooled connections, use unpooled',
     ],
-    docsUrl: "https://neon.com/docs/postgresql/postgres-upgrade",
+    docsUrl: 'https://neon.com/docs/postgresql/postgres-upgrade',
   },
-  "logical-replication": {
-    label: "Logical replication",
-    sizeRange: "> 200 GB or zero-downtime",
-    downtime: "Seconds",
-    when:
-      "Large databases or workloads that can't afford more than seconds of downtime. Run both projects in parallel and cut over when caught up.",
+  'logical-replication': {
+    label: 'Logical replication',
+    icon: DatabaseSyncIcon,
+    sizeRange: '> 200 GB',
+    downtime: 'Seconds',
+    when: "Large databases or workloads that can't afford more than seconds of downtime. Run both projects in parallel and cut over when caught up.",
     pros: [
-      "Near-zero downtime cutover",
-      "Run old and new versions in parallel",
-      "Easy rollback via reverse replication",
+      'Near-zero downtime cutover',
+      'Run old and new versions in parallel',
+      'Easy rollback via reverse replication',
     ],
     cons: [
       "Doesn't replicate sequences, large objects, or DDL",
-      "Tables must have replica identity (PRIMARY KEY recommended)",
-      "Enabling logical replication restarts compute",
+      'Tables must have replica identity (PRIMARY KEY recommended)',
+      'Enabling logical replication restarts compute',
     ],
-    docsUrl: "https://neon.com/docs/guides/logical-replication-neon-to-neon",
+    docsUrl: 'https://neon.com/docs/guides/logical-replication-neon-to-neon',
   },
-};
+}
 
 const ORDER: UpgradePath[] = [
-  "import-assistant",
-  "dump-restore",
-  "logical-replication",
-];
+  'import-assistant',
+  'dump-restore',
+  'logical-replication',
+]
 
 export default function MigratePage() {
-  const { assessment } = useAssessment();
+  const { assessment } = useAssessment()
   /* Without an assessment there's no size signal, so nothing is marked
      recommended rather than guessing on the user's behalf. */
-  const recommendedPath = assessment?.recommendedPath ?? null;
+  const recommendedPath = assessment?.recommendedPath ?? null
+  const defaultPath = recommendedPath ?? ORDER[0]
 
   return (
     <div className={neon.page}>
       <div className={neon.pageContent}>
         <PageHeader
-          title="Migrate"
-          subtitle="Choose a migration method and configure your target project."
+          title="Migration methods"
+          subtitle="Choose a migration method and configure your target project to start migrating."
+          className="bg-muted/30 rounded-sm p-6"
           actions={
             !assessment ? (
               <Button
@@ -106,118 +127,173 @@ export default function MigratePage() {
                 render={<Link href="/assess" />}
               >
                 Run an assessment first
-                <ArrowRight className="h-3.5 w-3.5" />
+                <HugeiconsIcon
+                  icon={ArrowRight01Icon}
+                  data-icon="inline-end"
+                  strokeWidth={2}
+                />
               </Button>
             ) : undefined
           }
         />
 
-        <h2 className={`${neon.h2} mb-3`}>Migration method</h2>
-        <div className="grid gap-4 lg:grid-cols-3">
-          {ORDER.map((id, i) => {
-            const p = PATHS[id];
-            const isRecommended = id === recommendedPath;
+        <Tabs
+          defaultValue={defaultPath}
+          className="border-border bg-background flex min-h-88 w-full flex-col items-stretch gap-0 overflow-hidden rounded-lg border"
+        >
+          <div className="border-border w-full shrink-0 border-b">
+            <TabsList
+              variant="line"
+              className="relative h-auto w-full items-stretch gap-0.5 rounded-none bg-transparent p-1"
+            >
+              <TabsIndicator className="bg-muted dark:bg-muted rounded-md border-0 shadow-none dark:border-0" />
+              {ORDER.map((id, index) => {
+                const path = PATHS[id];
+                const isRecommended = id === recommendedPath;
+                const methodNumber = String(index + 1).padStart(2, "0");
+                return (
+                  <TabsTrigger
+                    key={id}
+                    value={id}
+                    className="z-10 h-auto min-w-fit flex-1 items-center justify-center gap-2 rounded-md px-2.5 py-2.5 text-center whitespace-normal after:hidden data-active:bg-transparent dark:data-active:bg-transparent"
+                  >
+                    <HugeiconsIcon
+                      aria-hidden
+                      icon={path.icon}
+                      strokeWidth={2}
+                      className="text-muted-foreground in-data-active:text-primary size-5 shrink-0"
+                    />
+                    <span className="flex min-w-0 flex-wrap items-center justify-center gap-1.5">
+                      <span className="text-ui font-medium">{path.label}</span>
+                      {isRecommended ? (
+                        <Badge className="h-4 px-1.5 text-[10px] leading-none">
+                          Recommended
+                        </Badge>
+                      ) : null}
+                    </span>
+                    <span className="text-caption tnum text-muted-foreground in-data-active:text-foreground font-mono">
+                      {methodNumber}
+                    </span>
+                  </TabsTrigger>
+                );
+              })}
+            </TabsList>
+          </div>
+
+          {ORDER.map((id) => {
+            const path = PATHS[id];
             const isConsoleHandoff = id === "import-assistant";
             return (
-              <Link
+              <TabsContent
                 key={id}
-                href={UPGRADE_PATH_ROUTES[id]}
-                rel={isConsoleHandoff ? "noreferrer" : undefined}
-                style={{ "--enter-delay": `${i * 60}ms` } as React.CSSProperties}
-                target={isConsoleHandoff ? "_blank" : undefined}
-                className={`enter-rise group flex flex-col rounded-[4px] border p-5 transition-[background-color,border-color,transform] duration-150 ease-out active:scale-[0.99] ${neon.focusRing} ${
-                  isRecommended
-                    ? "border-primary/40 bg-primary/[0.04] hover:border-primary/60"
-                    : "border-border bg-card hover:border-primary/40 hover:bg-[#1a1b1b]"
-                }`}
+                value={id}
+                className="flex min-w-0 flex-1 flex-col self-stretch"
               >
-                {isRecommended && (
-                  <p className="tag mb-2 text-primary">Recommended</p>
-                )}
-                <p className="text-body font-medium text-foreground">
-                  {p.label}
-                </p>
-                {isConsoleHandoff && (
-                  <p className={`mt-1 text-label ${neon.muted}`}>
-                    Runs entirely in Neon Console.
-                  </p>
-                )}
-                <div className="mt-3 flex gap-3 text-label">
-                  <span className="font-mono text-foreground">
-                    {p.sizeRange}
-                  </span>
-                  <span className="text-border">·</span>
-                  <span className={neon.muted}>Downtime: {p.downtime}</span>
+                <div className="flex flex-1 flex-col gap-6 px-6 py-5">
+                  <div className="flex flex-wrap items-start justify-between gap-x-8 gap-y-3">
+                    <div className="flex min-w-0 flex-1 flex-col items-baseline gap-3">
+                      <h2 className={`${neon.h2} shrink-0`}>{path.label}</h2>
+                      <div className="flex max-w-xl min-w-0 flex-col gap-1.5">
+                        <p className="text-ui text-muted-foreground text-pretty">
+                          {path.when}
+                        </p>
+                        {path.consoleInstruction ? (
+                          <p className="text-ui text-muted-foreground text-pretty">
+                            {path.consoleInstruction}
+                          </p>
+                        ) : null}
+                      </div>
+                    </div>
+                    <dl className="flex shrink-0 gap-8">
+                      <PathMetric label="Size" value={path.sizeRange} />
+                      <PathMetric label="Downtime" value={path.downtime} />
+                    </dl>
+                  </div>
+
+                  <div className="grid gap-2 rounded-sm sm:grid-cols-2">
+                    <div className="bg-secondary flex flex-col gap-2 rounded-xs p-3.5">
+                      <p className="font-medium uppercase">Pros</p>
+                      <PathList items={path.pros} tone="pro" />
+                    </div>
+                    <div className="bg-secondary flex flex-col gap-2 rounded-xs p-3.5">
+                      <p className="font-medium uppercase">Cons</p>
+                      <PathList items={path.cons} tone="con" />
+                    </div>
+                  </div>
                 </div>
 
-                <div className="mt-4">
-                  <p className="tag mb-2">Pros</p>
-                  <ul className="space-y-1.5 text-caption text-foreground">
-                    {p.pros.map((x) => (
-                      <li key={x} className="flex items-start gap-1.5">
-                        <Check className="mt-0.5 h-3 w-3 shrink-0 text-primary" />
-                        {x}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-
-                <div className="mt-4">
-                  <p className="tag mb-2">Cons</p>
-                  <ul className={`space-y-1.5 text-caption ${neon.muted}`}>
-                    {p.cons.map((x) => (
-                      <li key={x} className="flex items-start gap-1.5">
-                        <span className="mt-0.5 h-3 w-3 shrink-0">·</span>
-                        {x}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-
-                <p className={`mt-4 text-caption leading-[1.6] ${neon.muted}`}>
-                  {p.when}
-                </p>
-                {p.consoleInstruction && (
-                  <p className={`mt-2 text-caption leading-[1.6] ${neon.muted}`}>
-                    {p.consoleInstruction}
-                  </p>
-                )}
-
-                <div className="mt-auto flex items-center justify-between gap-3 pt-4">
-                  <span className="inline-flex items-center gap-1 text-caption font-medium text-primary">
-                    {isConsoleHandoff ? "Open Neon Console" : "Start"}
-                    {isConsoleHandoff ? (
-                      <ExternalLink className="h-3 w-3" />
-                    ) : (
-                      <ArrowRight className="h-3 w-3" />
-                    )}
-                  </span>
-                  <span
-                    role="link"
-                    tabIndex={0}
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      window.open(p.docsUrl, "_blank", "noreferrer");
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        window.open(p.docsUrl, "_blank", "noreferrer");
-                      }
-                    }}
-                    className={`inline-flex cursor-pointer items-center gap-1 rounded-[2px] text-caption transition-colors duration-150 ease-out hover:text-primary hover:underline ${neon.muted} ${neon.focusRing}`}
+                <div className="mt-auto flex items-center justify-between gap-3 px-6 py-4">
+                  <Button
+                    variant="ghost"
+                    nativeButton={false}
+                    render={
+                      <a href={path.docsUrl} target="_blank" rel="noreferrer" />
+                    }
                   >
                     Neon docs
-                    <ExternalLink className="h-3 w-3" />
-                  </span>
+                    <HugeiconsIcon
+                      icon={ArrowUpRight01Icon}
+                      data-icon="inline-end"
+                      strokeWidth={2}
+                    />
+                  </Button>
+                  <Button
+                    nativeButton={false}
+                    render={
+                      isConsoleHandoff ? (
+                        <a
+                          href={UPGRADE_PATH_ROUTES[id]}
+                          target="_blank"
+                          rel="noreferrer"
+                        />
+                      ) : (
+                        <Link href={UPGRADE_PATH_ROUTES[id]} />
+                      )
+                    }
+                  >
+                    {isConsoleHandoff ? "Open Neon Console" : "Start migration"}
+                    <HugeiconsIcon
+                      icon={
+                        isConsoleHandoff ? ArrowUpRight01Icon : ArrowRight02Icon
+                      }
+                      data-icon="inline-end"
+                      strokeWidth={2}
+                    />
+                  </Button>
                 </div>
-              </Link>
+              </TabsContent>
             );
           })}
-        </div>
+        </Tabs>
       </div>
     </div>
   );
+}
+
+function PathMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex min-w-0 flex-col gap-0.5 text-right">
+      <dt className="tag">{label}</dt>
+      <dd className="font-mono text-caption text-foreground">{value}</dd>
+    </div>
+  )
+}
+
+function PathList({ items, tone }: { items: string[]; tone: 'pro' | 'con' }) {
+  const icon = tone === 'pro' ? DiamondPlusIcon : DiamondMinusIcon
+  return (
+    <ul className="flex flex-col gap-2">
+      {items.map((item) => (
+        <li key={item} className="flex items-start gap-2 text-caption">
+          <HugeiconsIcon
+            aria-hidden
+            icon={icon}
+            strokeWidth={2}
+            className="mt-0.5 size-3.5 shrink-0 text-muted-foreground/70"
+          />
+          <span className="text-sm text-muted-foreground">{item}</span>
+        </li>
+      ))}
+    </ul>
+  )
 }
