@@ -35,8 +35,8 @@ export function SetupGate({ children }: { children: React.ReactNode }) {
     <SidebarProvider className="h-full min-h-0 flex-1">
       <Sidebar />
       <SidebarInset className="bg-background">
-        <TopBar />
         <LabsBanner />
+        <TopBar />
         {status.error && (
           <ConfigErrorBanner
             loading={status.loading}

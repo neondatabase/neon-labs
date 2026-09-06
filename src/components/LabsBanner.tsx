@@ -1,6 +1,6 @@
 export function LabsBanner() {
   return (
-    <aside
+    <div
       aria-label="Experimental tools notice"
       className="relative isolate overflow-hidden border-b border-[#00e599]/20 bg-[#0e1815] px-4 py-2.5 sm:px-6"
     >
@@ -14,22 +14,20 @@ export function LabsBanner() {
       />
 
       <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-center gap-x-3 gap-y-1.5 text-center">
-        <span className="inline-flex shrink-0 items-center gap-1.5 rounded-[3px] border border-[#00e599]/25 bg-[#00e599]/[0.08] px-2 py-1 text-[10px] font-medium uppercase leading-none tracking-[0.12em] text-[#7ff5cf]">
+        <span className="inline-flex shrink-0 items-center gap-1.5 rounded-[3px] border border-[#00e599]/25 bg-[#00e599]/[0.08] px-2 py-1 text-[10px] leading-none font-medium tracking-[0.12em] text-[#7ff5cf] uppercase">
           <span
             aria-hidden="true"
             className="size-1.5 bg-[#00e599] shadow-[0_0_8px_rgba(0,229,153,0.65)]"
           />
           Experimental
         </span>
-        <p className="text-pretty text-xs leading-5 text-[#d1d5db]">
+        <p className="text-xs leading-5 text-pretty text-[#d1d5db]">
           <span className="font-medium text-[#f3f4f6]">
-            Neon Labs is a space for experimental tools.
+            Neon Labs is a space for experimental tools. Not intended for
+            production use
           </span>{" "}
-          <span className="text-[#7ff5cf]">
-            Not intended for production use
-          </span>
         </p>
       </div>
-    </aside>
-  );
+    </div>
+  )
 }
