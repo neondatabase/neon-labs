@@ -1,61 +1,84 @@
-import Link from "next/link";
-import { ArrowLeftRight, CircleArrowUp } from "lucide-react";
-import { NeonMark } from "@/components/NeonLogo";
-import { neon } from "@/components/ui";
+import Link from "next/link"
+import { ArrowRight02Icon } from "@hugeicons/core-free-icons"
+import { HugeiconsIcon } from "@hugeicons/react"
+import {
+  ToolCard,
+  ToolCardDescription,
+  ToolCardFooter,
+  ToolCardHeader,
+  ToolCardTitle,
+  ToolCardWash,
+} from "@/components/tool-card"
+import { PageHeader, neon } from "@/components/ui"
+import { Button } from "@/components/ui/button"
+import { cn } from "@/lib/utils"
 
 const TOOLS = [
   {
     href: "/assess",
-    icon: CircleArrowUp,
     title: "PG Upgrade Assessment",
     description:
-      "Upgrade your Postgres major version on Neon. Assess breaking changes, plan your migration path, and execute the upgrade with guided tooling.",
+      "See which version changes hit your schema, then pick a path and run the upgrade.",
+    meta: "Major version",
+    action: "Use tool",
   },
   {
     href: "/migrate",
-    icon: ArrowLeftRight,
     title: "Migration Assistant",
     description:
-      "Migrate your database between Neon projects. Compare schemas, transfer data with replication or dump/restore, and cut over with confidence.",
+      "Move data between Neon projects with dump/restore or logical replication.",
+    meta: "Between projects",
+    action: "Use tool",
   },
-];
+]
 
 export default function LauncherPage() {
   return (
-    <div className={`${neon.page} flex min-h-full flex-col justify-center`}>
-      <div className="mx-auto w-full max-w-[760px] text-center">
-        <NeonMark className="mx-auto h-8 w-8 text-primary" />
-        <h1 className="mt-5 text-display-sm font-medium display-tight text-foreground">
-          Neon Labs
-        </h1>
+    <div
+      className={cn("flex min-h-full flex-col justify-start pt-4", neon.page)}
+    >
+      <div className="mx-auto w-full max-w-[760px]">
+        <PageHeader
+          className="enter-rise mb-6"
+          title="Postgres Tools"
+          subtitle="Upgrade a project's major version, or move a database between Neon projects."
+        />
 
-        <h2 className={`mt-14 ${neon.h2}`}>Postgres Tools</h2>
-        <p className={`mt-1 text-ui text-pretty ${neon.muted}`}>
-          Guided workflows for upgrading and migrating your Postgres databases
-          on Neon.
-        </p>
-
-        <div className="mt-6 grid gap-4 text-left sm:grid-cols-2">
-          {TOOLS.map(({ href, icon: Icon, title, description }, i) => (
-            <Link
+        <div className="grid gap-3 sm:grid-cols-2">
+          {TOOLS.map(({ href, title, description, meta, action }, i) => (
+            <ToolCard
               key={href}
-              href={href}
-              style={{ "--enter-delay": `${i * 60}ms` } as React.CSSProperties}
-              className={`enter-rise group flex flex-col rounded-[4px] border border-border bg-card p-5 transition-[background-color,border-color,transform] duration-150 ease-out active:scale-[0.99] hover:border-primary/40 hover:bg-[#1a1b1b] ${neon.focusRing}`}
+              className="enter-rise"
+              style={
+                {
+                  "--enter-delay": `${(i + 1) * 70}ms`,
+                } as React.CSSProperties
+              }
             >
-              <span className="flex h-9 w-9 items-center justify-center rounded-[4px] bg-primary/10 text-primary">
-                <Icon className="h-[18px] w-[18px]" />
-              </span>
-              <p className="mt-4 text-body-lg font-medium text-foreground">
-                {title}
-              </p>
-              <p className={`mt-2 text-caption leading-[1.6] ${neon.muted}`}>
-                {description}
-              </p>
-            </Link>
+              <ToolCardWash />
+              <ToolCardHeader>
+                <ToolCardTitle className="overflow-visible whitespace-normal">
+                  {title}
+                </ToolCardTitle>
+              </ToolCardHeader>
+              <ToolCardDescription>{description}</ToolCardDescription>
+              <ToolCardFooter className="justify-between">
+                <span className="text-muted-foreground/70 font-mono text-[10px]">
+                  {meta}
+                </span>
+                <Button nativeButton={false} render={<Link href={href} />}>
+                  {action}
+                  <HugeiconsIcon
+                    icon={ArrowRight02Icon}
+                    data-icon="inline-end"
+                    strokeWidth={2}
+                  />
+                </Button>
+              </ToolCardFooter>
+            </ToolCard>
           ))}
         </div>
       </div>
     </div>
-  );
+  )
 }

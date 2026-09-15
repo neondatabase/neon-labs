@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
-import { ArrowLeft, Plug } from "lucide-react";
+import { Plug } from "lucide-react";
 import { useSetupStatus } from "@/lib/setup-status";
 import { clearPersistedNeonSecrets } from "@/lib/neon-settings";
 import { SetupLanding } from "./SetupLanding";
@@ -35,16 +35,13 @@ export function SetupGate({ children }: { children: React.ReactNode }) {
     <SidebarProvider className="h-full min-h-0 flex-1">
       <Sidebar />
       <SidebarInset className="bg-background">
-        <TopBar />
         <LabsBanner />
+        <TopBar />
         {status.error && (
           <ConfigErrorBanner
             loading={status.loading}
             onRetry={() => void status.refresh().catch(() => undefined)}
           />
-        )}
-        {!status.error && !status.ready && status.skipped && (
-          <UnconnectedBanner onConnect={status.unskip} />
         )}
         <main className="min-h-0 flex-1 overflow-auto">{children}</main>
         <AppFooter />
@@ -81,33 +78,6 @@ function ConfigErrorBanner({
         className="font-medium text-[#f59e0b] underline underline-offset-2 hover:bg-[#f59e0b]/10 hover:text-[#f59e0b]"
       >
         {loading ? "Retrying…" : "Retry"}
-      </Button>
-    </Notice>
-  );
-}
-
-function UnconnectedBanner({ onConnect }: { onConnect: () => void }) {
-  return (
-    <Notice
-      tone="warning"
-      className="flex-wrap items-center gap-x-2 gap-y-1 rounded-none border-x-0 border-t-0 px-8 py-2 text-caption"
-    >
-      <NoticeIcon>
-        <Plug />
-      </NoticeIcon>
-      <span className="text-foreground">
-        Not connected to Neon. Pages render, but assessments and migrations
-        won&apos;t run.
-      </span>
-      <Button
-        type="button"
-        variant="ghost"
-        size="xs"
-        onClick={onConnect}
-        className="font-medium text-[#f59e0b] underline underline-offset-2 hover:bg-[#f59e0b]/10 hover:text-[#f59e0b]"
-      >
-        <ArrowLeft />
-        Return to sign in
       </Button>
     </Notice>
   );

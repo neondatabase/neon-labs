@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "../components/tokens.css";
 
 /* ──────────────────────────────────────────────────────────────
    Neon UI tokens — https://ui.neon.com/r/neon-tokens.json
